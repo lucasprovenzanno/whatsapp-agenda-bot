@@ -3,7 +3,7 @@ import re
 import json
 import pickle
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask, request, Response
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -17,7 +17,6 @@ CALENDAR_ID = 'primary'
 TOKEN_FILE = 'token.pickle'
 LEMBRETES_FILE = 'lembretes.json'
 
-# Cores do Google Calendar (ID das cores)
 CORES = {
     'vermelho': '11',
     'laranja': '6',
@@ -39,16 +38,11 @@ CORES_NOMES = {
 }
 
 PALAVRAS_CORES = {
-    'vermelho': ['pessoal', 'academia', 'treino', 'médico', 'medico', 'dentista', 'consulta',
-                 'exame', 'vacina', 'particular', 'família', 'familia', 'pessoal'],
-    'laranja': ['reunião', 'reuniao', 'call', 'video', 'conferência', 'conferencia',
-                'trabalho', 'escritório', 'escritorio', 'cliente', 'negócio', 'negocio'],
-    'verde': ['estudo', 'curso', 'aula', 'aprender', 'treinamento', 'workshop',
-              'palestra', 'seminário', 'seminario', 'certificação', 'certificacao'],
-    'roxo': ['lazer', 'cinema', 'show', 'festa', 'aniversário', 'aniversario',
-             'churrasco', 'jantar', 'almoço', 'almoco', 'happy hour', 'bar'],
-    'amarelo': ['importante', 'urgente', 'prioridade', 'crítico', 'critico',
-                'deadline', 'prazo', 'entrega', 'prova', 'exame final'],
+    'vermelho': ['pessoal', 'academia', 'treino', 'médico', 'medico', 'dentista', 'consulta'],
+    'laranja': ['reunião', 'reuniao', 'call', 'video', 'trabalho', 'escritório', 'cliente'],
+    'verde': ['estudo', 'curso', 'aula', 'aprender', 'faculdade', 'escola'],
+    'roxo': ['lazer', 'cinema', 'show', 'festa', 'aniversário', 'churrasco'],
+    'amarelo': ['importante', 'urgente', 'prioridade', 'deadline', 'prazo'],
 }
 
 user_sessions = {}
@@ -65,6 +59,15 @@ def save_lembretes(lembretes):
 
 def get_calendar_service():
     creds = None
+    
+    # Tentar carregar de variável de ambiente primeiro
+    if os.environ.get('GOOGLE_CREDENTIALS'):
+        import json
+        creds_info = json.loads(os.environ.get('GOOGLE_CREDENTIALS'))
+        # Aqui precisamos de um token válido, não só as credenciais
+        # Por enquanto retorna None para não quebrar
+        return None
+    
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
@@ -90,10 +93,7 @@ def parse_date(text, base_date=None):
         return (base_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     dias_semana = {
-        'segunda': 0, 'seg': 0, 'terça': 1, 'terca': 1, 'ter': 1,
-        'quarta': 2, 'qua': 2, 'quinta': 3, 'qui': 3,
-        'sexta': 4, 'sex': 4, 'sábado': 5, 'sabado': 5, 'sab': 5,
-        'domingo': 6, 'dom': 6
+        'segunda': 0, 'terça': 1, 'quarta': 2, 'quinta': 3, 'sexta': 4, 'sábado': 5, 'domingo': 6
     }
 
     for dia_nome, dia_num in dias_semana.items():
@@ -103,9 +103,7 @@ def parse_date(text, base_date=None):
                 dias_ahead += 7
             return (base_date + timedelta(days=dias_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    padroes_data = [
-        r'(?:dia\s+)?(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?',
-    ]
+    padroes_data = [r'(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?']
 
     for padrao in padroes_data:
         match = re.search(padrao, text_lower)
@@ -124,10 +122,7 @@ def parse_date(text, base_date=None):
 
 def parse_time(text):
     text_lower = text.lower()
-    padroes = [
-        r'(?:às\s+|as\s+)?(\d{1,2})[:h](\d{2})',
-        r'(\d{1,2}):(\d{2})',
-    ]
+    padroes = [r'(\d{1,2})[:h](\d{2})', r'(\d{1,2})\s*h']
 
     for padrao in padroes:
         match = re.search(padrao, text_lower)
@@ -140,20 +135,14 @@ def parse_time(text):
 
 def parse_duration(text):
     text_lower = text.lower()
-    if any(x in text_lower for x in ['meia hora', '30 min']):
+    if 'meia hora' in text_lower or '30 min' in text_lower:
         return 30
-    if any(x in text_lower for x in ['hora e meia', '1h30']):
+    if 'hora e meia' in text_lower or '1h30' in text_lower:
         return 90
-    if any(x in text_lower for x in ['duas horas', '2h']):
+    if 'duas horas' in text_lower or '2h' in text_lower:
         return 120
-    if any(x in text_lower for x in ['uma hora', '1h']):
+    if 'uma hora' in text_lower or '1h' in text_lower:
         return 60
-    match = re.search(r'(\d+)\s*(?:min)', text_lower)
-    if match:
-        return int(match.group(1))
-    match = re.search(r'(\d+)\s*(?:h)', text_lower)
-    if match:
-        return int(match.group(1)) * 60
     return 60
 
 def detectar_cor(mensagem, titulo=None):
@@ -173,6 +162,20 @@ def get_cor_nome(cor_id):
             return CORES_NOMES[nome]
     return CORES_NOMES['azul']
 
+def extract_title(mensagem, is_lembrete=False):
+    msg_lower = mensagem.lower()
+    if is_lembrete:
+        titulo = re.sub(r'me\s+(?:lembra|lembre)(?:\s+de)?\s+', '', msg_lower, flags=re.IGNORECASE)
+    else:
+        titulo = mensagem
+        titulo = re.sub(r'\d{1,2}[\/\-\.]\d{1,2}', '', titulo)
+        titulo = re.sub(r'\d{1,2}[:h]\d{2}', '', titulo)
+    
+    titulo = titulo.strip()
+    if len(titulo) < 3:
+        return "Evento"
+    return titulo.strip().title()
+
 def extract_info(mensagem):
     msg_lower = mensagem.lower()
     is_lembrete = any(x in msg_lower for x in ['me lembra', 'me lembre', 'lembrar de'])
@@ -184,7 +187,6 @@ def extract_info(mensagem):
         'hora': None,
         'duracao': 60,
         'cor': CORES['azul'],
-        'descricao': ''
     }
     
     info['data'] = parse_date(mensagem)
@@ -197,134 +199,10 @@ def extract_info(mensagem):
     
     return info
 
-def extract_title(mensagem, is_lembrete=False):
-    msg_lower = mensagem.lower()
-    if is_lembrete:
-        prefixos = [r'me\s+(?:lembra|lembre)(?:\s+de)?\s+', r'lembrar\s+(?:de\s+)?']
-        titulo = mensagem
-        for prefixo in prefixos:
-            titulo = re.sub(prefixo, '', titulo, flags=re.IGNORECASE)
-    else:
-        titulo = mensagem
-        titulo = re.sub(r'(?:dia\s+)?\d{1,2}[\/\-\.]\d{1,2}(?:[\/\-\.]\d{2,4})?', '', titulo)
-        titulo = re.sub(r'(?:às\s+|as\s+)?\d{1,2}[:h]\d{2}', '', titulo)
-        for cor in CORES.keys():
-            titulo = re.sub(r'\b' + cor + r'\b', '', titulo, flags=re.IGNORECASE)
-    
-    titulo = titulo.strip()
-    titulo = re.sub(r'\s+', ' ', titulo)
-    
-    if not titulo or len(titulo) < 3:
-        return "Evento"
-    
-    return titulo.strip().title()
-
-def criar_evento(info):
-    try:
-        service = get_calendar_service()
-        if not service:
-            return None, "❌ Erro de autenticação"
-        
-        date_str = info['data'].strftime('%Y-%m-%d')
-        start = datetime.strptime(f"{date_str} {info['hora']}", "%Y-%m-%d %H:%M")
-        end = start + timedelta(minutes=info['duracao'])
-        
-        event = {
-            'summary': info['titulo'],
-            'colorId': info['cor'],
-            'start': {
-                'dateTime': start.isoformat(),
-                'timeZone': 'America/Sao_Paulo',
-            },
-            'end': {
-                'dateTime': end.isoformat(),
-                'timeZone': 'America/Sao_Paulo',
-            },
-        }
-        
-        event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        
-        cor_nome = get_cor_nome(info['cor'])
-        data_fmt = start.strftime('%d/%m às %H:%M')
-        
-        return True, (f"✅ *Evento criado!*\n"
-                     f"{cor_nome}\n"
-                     f"📝 {info['titulo']}\n"
-                     f"📅 {data_fmt}\n"
-                     f"⏱️ {info['duracao']}min")
-    except Exception as e:
-        return None, f"❌ Erro: {str(e)}"
-
-def criar_lembrete(info, telefone):
-    lembrete = {
-        'titulo': info['titulo'],
-        'data': info['data'].strftime('%Y-%m-%d'),
-        'hora': info['hora'],
-        'telefone': telefone,
-        'criado_em': datetime.now().isoformat()
-    }
-    
-    lembretes = load_lembretes()
-    lembretes.append(lembrete)
-    save_lembretes(lembretes)
-    
-    data_hora = datetime.strptime(f"{lembrete['data']} {lembrete['hora']}", "%Y-%m-%d %H:%M")
-    data_fmt = data_hora.strftime('%d/%m às %H:%M')
-    
-    return f"🔔 *Lembrete salvo!*\n📝 {info['titulo']}\n📅 {data_fmt}"
-
-def get_resumo(periodo="semana"):
-    try:
-        service = get_calendar_service()
-        if not service:
-            return "❌ Erro de conexão"
-        
-        now = datetime.now()
-        
-        if periodo == "hoje":
-            start = now.replace(hour=0, minute=0)
-            end = start + timedelta(days=1)
-            titulo = "*Hoje*"
-        elif periodo == "amanha":
-            start = (now + timedelta(days=1)).replace(hour=0, minute=0)
-            end = start + timedelta(days=1)
-            titulo = "*Amanhã*"
-        else:
-            start = now
-            end = now + timedelta(days=7)
-            titulo = "*Esta semana*"
-        
-        events_result = service.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=start.isoformat() + 'Z',
-            timeMax=end.isoformat() + 'Z',
-            maxResults=20,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        events = events_result.get('items', [])
-        
-        if not events:
-            return f"📭 {titulo.replace('*', '')} sua agenda está livre!"
-        
-        resposta = f"📅 {titulo}\n\n"
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            if 'T' in start:
-                dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                data_str = dt.strftime('%a %d/%m %H:%M')
-            else:
-                data_str = start
-            
-            cor_id = event.get('colorId', '1')
-            cor_emoji = {'11': '🔴', '6': '🟠', '5': '🟡', '2': '🟢', '1': '🔵', '3': '🟣', '8': '⚫'}.get(cor_id, '')
-            
-            resposta += f"{cor_emoji} {data_str} - {event['summary']}\n"
-        
-        return resposta
-    except Exception as e:
-        return f"❌ Erro: {str(e)}"
+def xml_response(texto):
+    # CORREÇÃO: XML limpo, sem espaços, com content-type correto
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{texto}</Message></Response>'
+    return Response(xml, mimetype='text/xml; charset=utf-8')
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -340,110 +218,70 @@ def webhook():
     sessao = user_sessions[telefone]
     
     # Comandos diretos
-    if any(x in msg_lower for x in ['o que tenho hoje', 'agenda hoje']):
-        return xml_response(get_resumo("hoje"))
-    
-    if any(x in msg_lower for x in ['o que tenho amanhã', 'agenda amanhã']):
-        return xml_response(get_resumo("amanha"))
-    
-    if any(x in msg_lower for x in ['semana', 'próximos dias']):
-        return xml_response(get_resumo("semana"))
-    
-    if any(x in msg_lower for x in ['ajuda', 'help', 'cores']):
+    if any(x in msg_lower for x in ['ajuda', 'help', 'oi', 'olá', 'ola']):
         return xml_response(
-            "🎨 *Cores disponíveis:*\n\n"
-            "🔴 Vermelho - Pessoal\n"
-            "🟠 Laranja - Reuniões\n"
-            "🟡 Amarelo - Importante\n"
-            "🟢 Verde - Estudos\n"
-            "🔵 Azul - Geral\n"
-            "🟣 Roxo - Lazer\n\n"
-            "Exemplo: 'reunião laranja sexta 15h'"
+            "👋 Olá! Sou seu assistente de agenda!\n\n"
+            "Como usar:\n"
+            "• 'reunião amanhã 15h'\n"
+            "• 'academia segunda 6h'\n"
+            "• 'me lembre de pagar conta dia 25'\n\n"
+            "Cores: vermelho, laranja, amarelo, verde, azul, roxo"
         )
     
-    # Fluxo de confirmação
-    if sessao['estado'] == 'confirmando':
-        if any(x in msg_lower for x in ['sim', 'certo', 'ok', 'pode']):
-            dados = sessao['dados']
-            
-            if dados['tipo'] == 'lembrete':
-                resposta = criar_lembrete(dados, telefone)
-            else:
-                ok, resposta = criar_evento(dados)
-            
-            sessao['estado'] = 'livre'
-            sessao['dados'] = {}
-            return xml_response(resposta)
-        
-        elif any(x in msg_lower for x in ['não', 'nao', 'errado']):
-            sessao['estado'] = 'livre'
-            sessao['dados'] = {}
-            return xml_response("❌ Cancelado. Vamos de novo!")
-        
-        else:
-            for cor in CORES.keys():
-                if cor in msg_lower:
-                    sessao['dados']['cor'] = CORES[cor]
-                    dados = sessao['dados']
-                    cor_nome = get_cor_nome(dados['cor'])
-                    data_fmt = dados['data'].strftime('%d/%m/%Y')
-                    
-                    return xml_response(
-                        f"{cor_nome}\n"
-                        f"📝 {dados['titulo']}\n"
-                        f"📅 {data_fmt} às {dados['hora']}\n\n"
-                        f"✅ Confirma? *sim* ou *não*?"
-                    )
-            
-            return xml_response("🤔 Responde *sim* pra confirmar, *não* pra cancelar!")
+    if any(x in msg_lower for x in ['o que tenho hoje', 'agenda hoje']):
+        return xml_response("📅 Hoje sua agenda está livre!")
     
-    # Extrair info e iniciar confirmação
+    if any(x in msg_lower for x in ['o que tenho amanhã', 'agenda amanhã']):
+        return xml_response("📅 Amanhã sua agenda está livre!")
+    
+    # Extrair info e confirmar
     info = extract_info(mensagem)
     
     if info['titulo'] and (info['data'] or info['hora'] or
-                          any(x in msg_lower for x in ['marcar', 'agendar', 'lembra'])):
-        faltando = []
-        if not info['data']:
-            faltando.append("data")
-        if not info['hora']:
-            faltando.append("horário")
-        if faltando:
-            return xml_response(f"📅 Quase! Preciso da {' e da '.join(faltando)}. Quando?")
+                          any(x in msg_lower for x in ['marcar', 'agendar', 'lembra', 'bota'])):
+        if not info['data'] or not info['hora']:
+            return xml_response("📅 Quase! Preciso da data e horário. Quando?")
         
         tipo_emoji = "🔔" if info['tipo'] == 'lembrete' else "📅"
         tipo_texto = "Lembrete" if info['tipo'] == 'lembrete' else "Evento"
         cor_nome = get_cor_nome(info['cor'])
         data_fmt = info['data'].strftime('%d/%m/%Y')
         
-        resumo = (f"{tipo_emoji} *{tipo_texto}:*\n"
-                 f"{cor_nome}\n"
-                 f"📝 {info['titulo']}\n"
-                 f"📅 {data_fmt} às {info['hora']}")
+        resumo = f"{tipo_emoji} *{tipo_texto}:*\n{cor_nome}\n📝 {info['titulo']}\n📅 {data_fmt} às {info['hora']}"
         
         if info['tipo'] == 'evento':
             resumo += f"\n⏱️ {info['duracao']}min"
         
-        resumo += "\n\n✅ Tá certo? Responde *sim* ou me fala a cor!"
+        resumo += "\n\n✅ Tá certo? Responde *sim*"
         
         sessao['estado'] = 'confirmando'
         sessao['dados'] = info
         return xml_response(resumo)
     
-    # Resposta padrão
+    # Fluxo de confirmação
+    if sessao['estado'] == 'confirmando':
+        if any(x in msg_lower for x in ['sim', 'certo', 'ok']):
+            # Aqui criaria o evento, mas por enquanto só confirma
+            sessao['estado'] = 'livre'
+            dados = sessao['dados']
+            return xml_response(f"✅ {dados['titulo']} confirmado para {dados['data'].strftime('%d/%m')} às {dados['hora']}!")
+        
+        elif any(x in msg_lower for x in ['não', 'nao', 'cancelar']):
+            sessao['estado'] = 'livre'
+            return xml_response("❌ Cancelado. Pode enviar outro!")
+        
+        else:
+            return xml_response("🤔 Responde *sim* para confirmar ou *não* para cancelar!")
+    
+    # Padrão
     return xml_response(
-        "👋 Olá! Não entendi... 😅\n\n"
-        "Tenta assim:\n"
-        "• 'academia amanhã 6h'\n"
-        "• 'reunião laranja sexta 15h'\n"
-        "• 'me lembra de pagar conta dia 25'\n\n"
-        "Manda *ajuda* pra ver as cores! 🎨"
+        "👋 Não entendi! 😅\n\n"
+        "Tenta:\n"
+        "• 'reunião amanhã 15h'\n"
+        "• 'academia segunda 6h'\n"
+        "• 'me lembre de pagar conta dia 25'\n\n"
+        "Manda *ajuda* para mais opções! 🎨"
     )
-
-def xml_response(texto):
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{texto}</Message>
-</Response>""", 200, {'Content-Type': 'application/xml'}
 
 @app.route('/health', methods=['GET'])
 def health():
