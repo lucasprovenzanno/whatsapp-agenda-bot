@@ -1,6 +1,6 @@
 import os, json, re, threading, time
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask, request, jsonify  # <-- ADICIONADO jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from google.oauth2 import service_account
@@ -9,8 +9,8 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # IDs dos calendários
-CAL_ID_EVENTOS = 'lucasprovenzano.cobeb@gmail.com'  # Agenda principal (eventos visíveis)
-CAL_ID_LEMBRETES = 'lucas.provenzanno@gmail.com'     # Seu e-mail pessoal (lembretes ocultos)
+CAL_ID_EVENTOS = 'lucasprovenzano.cobeb@gmail.com'
+CAL_ID_LEMBRETES = 'lucas.provenzanno@gmail.com'
 
 # Cores
 CORES = {'vermelho': '11', 'laranja': '6', 'amarelo': '5', 'verde': '10', 'azul': '9', 'roxo': '3'}
@@ -111,11 +111,15 @@ def enviar_whatsapp(numero, mensagem):
 
 def verificar_lembretes():
     """Verifica a cada minuto se há lembretes para enviar"""
+    print("🔄 Thread de lembretes iniciada")
     while True:
         try:
             agora = datetime.now()
+            # Busca eventos no próximo minuto
             time_min = agora.isoformat() + 'Z'
             time_max = (agora + timedelta(minutes=2)).isoformat() + 'Z'
+            
+            print(f"🔍 Verificando lembretes... {agora.strftime('%H:%M:%S')}")
             
             events = service.events().list(
                 calendarId=CAL_ID_LEMBRETES,
@@ -126,10 +130,13 @@ def verificar_lembretes():
                 q='[LEMBRETE]'
             ).execute()
             
+            print(f"   Encontrados: {len(events.get('items', []))}")
+            
             for event in events.get('items', []):
                 event_id = event.get('id')
                 
                 if event_id in lembretes_enviados:
+                    print(f"   ⚠️ Já enviado: {event_id[:10]}")
                     continue
                 
                 titulo = event.get('summary', '').replace('[LEMBRETE] ', '')
@@ -138,12 +145,16 @@ def verificar_lembretes():
                 
                 mensagem = f"⏰ *Lembrete!*\n\n*{titulo}*\n⏰ {agora.strftime('%H:%M')}"
                 
+                print(f"   📤 Enviando para {numero}: {titulo}")
+                
                 if enviar_whatsapp(numero, mensagem):
                     lembretes_enviados.add(event_id)
-                    print(f"✅ Lembrete enviado: {titulo}")
+                    print(f"   ✅ Enviado com sucesso!")
                     
         except Exception as e:
             print(f"❌ Erro verificando lembretes: {e}")
+            import traceback
+            traceback.print_exc()
         
         time.sleep(60)
 
@@ -165,7 +176,6 @@ def webhook():
 
 *Lembretes (alerta no WhatsApp):*
 • lembrete pagar conta amanhã 15h
-• lembrete reunião João segunda 10h
 
 *Cores:* vermelho, laranja, amarelo, verde, azul, roxo""")
         return str(resp)
@@ -177,7 +187,6 @@ def webhook():
     titulo, inicio, eh_lembrete, cor = p
     
     if eh_lembrete:
-        # Salva no seu e-mail pessoal (calendário oculto)
         evento = {
             'summary': f'[LEMBRETE] {titulo}',
             'description': f'Numero: {numero}',
@@ -200,7 +209,6 @@ def webhook():
             resp.message(f"❌ Erro: {str(e)[:100]}")
             
     else:
-        # Evento normal (agenda principal)
         evento = {
             'summary': titulo,
             'colorId': cor,
