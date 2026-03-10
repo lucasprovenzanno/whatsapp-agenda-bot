@@ -1,20 +1,18 @@
 import os
 import re
 import json
-import pickle
 from datetime import datetime, timedelta
 from flask import Flask, request, Response
 
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
+# Configuração do Service Account
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 CALENDAR_ID = 'primary'
-TOKEN_FILE = 'token.pickle'
-LEMBRETES_FILE = 'lembretes.json'
+SERVICE_ACCOUNT_FILE = 'service_account.json'
 
 CORES = {
     'vermelho': '11', 'laranja': '6', 'amarelo': '5',
@@ -37,16 +35,13 @@ PALAVRAS_CORES = {
 user_sessions = {}
 
 def get_calendar_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            return None
-    return build('calendar', 'v3', credentials=creds)
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        return build('calendar', 'v3', credentials=credentials)
+    except Exception as e:
+        print(f"❌ Erro na autenticação: {e}")
+        return None
 
 def parse_date(text, base_date=None):
     if base_date is None:
@@ -126,7 +121,7 @@ def criar_evento(info):
     try:
         service = get_calendar_service()
         if not service:
-            return None, "❌ Erro: Não autenticado no Google Calendar"
+            return None, "❌ Erro: Não foi possível conectar ao Google Calendar"
         
         date_str = info['data'].strftime('%Y-%m-%d')
         start = datetime.strptime(f"{date_str} {info['hora']}", "%Y-%m-%d %H:%M")
