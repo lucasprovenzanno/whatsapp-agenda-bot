@@ -5,11 +5,18 @@ from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 app = Flask(__name__)
-CAL_ID = 'lucasprovenzano.cobeb@gmail.com'
 
-# Twilio (para enviar mensagens depois)
+# IDs dos calendários
+CAL_ID_EVENTOS = 'lucasprovenzano.cobeb@gmail.com'
+CAL_ID_LEMBRETES = 'lucasprovenzano.cobeb@gmail.com'  # Por enquanto usa o mesmo, depois criamos um separado
+
+# Cores
+CORES = {'vermelho': '11', 'laranja': '6', 'amarelo': '5', 'verde': '10', 'azul': '9', 'roxo': '3'}
+
+# Twilio
 TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
@@ -22,29 +29,24 @@ creds = service_account.Credentials.from_service_account_info(
 )
 service = build('calendar', 'v3', credentials=creds)
 
-# Lembretes pendentes (em memória - reinicia se o servidor cair)
-lembretes = []
+# Controle de lembretes já enviados (evita duplicar)
+lembretes_enviados = set()
 
 def parse(msg):
     hoje = datetime.now()
     msg_lower = msg.lower()
     
-    # Detecta se é lembrete (não vai para agenda)
     eh_lembrete = 'lembrete' in msg_lower
     
-    # Detecta cor
-    cores = {'vermelho': '11', 'laranja': '6', 'amarelo': '5', 'verde': '10', 'azul': '9', 'roxo': '3'}
     cor = '9'
-    for nome, codigo in cores.items():
+    for nome, codigo in CORES.items():
         if nome in msg_lower:
             cor = codigo
             msg_lower = msg_lower.replace(nome, '')
             break
     
-    # Limpa
     msg_lower = re.sub(r'(lembrete|de\s+)', '', msg_lower)
     
-    # Data
     if 'amanhã' in msg_lower or 'amanha' in msg_lower:
         data = hoje + timedelta(days=1)
         msg_lower = re.sub(r'amanh[ãa]', '', msg_lower)
@@ -66,10 +68,7 @@ def parse(msg):
     else:
         return None
     
-    # Hora (se não for lembrete ou se tiver hora específica no lembrete)
     hora, minuto = 9, 0
-    tem_hora = False
-    
     padroes = [r'(?:às\s*)?(\d{1,2}):(\d{2})', r'(\d{1,2})h(\d{2})', r'(\d{1,2})\s*(?:h|horas?)', r'(?:às?\s+)(\d{1,2})']
     for padrao in padroes:
         if m := re.search(padrao, msg_lower):
@@ -78,49 +77,85 @@ def parse(msg):
             if 'tarde' in msg_lower and hora < 12: hora += 12
             elif 'noite' in msg_lower and hora < 12: hora += 12
             msg_lower = msg_lower.replace(m.group(0), '')
-            tem_hora = True
             break
     
-    # Monta datetime
     inicio = data.replace(hour=hora, minute=minuto, second=0)
     if inicio < hoje and not eh_lembrete:
         inicio += timedelta(days=1)
     
-    # Título
     titulo = re.sub(r'\s+', ' ', msg_lower).strip().title()
     if len(titulo) < 2: titulo = "Lembrete" if eh_lembrete else "Evento"
     
     return titulo, inicio, eh_lembrete, cor
 
-def enviar_lembrete(numero, mensagem, quando):
-    """Agenda envio de mensagem no futuro"""
-    agora = datetime.now()
-    espera = (quando - agora).total_seconds()
+def enviar_whatsapp(numero, mensagem):
+    """Envia mensagem via Twilio"""
+    if not twilio_client:
+        print(f"❌ Twilio não configurado. Mensagem: {mensagem}")
+        return False
     
-    if espera <= 0:
-        # Já passou, envia agora
-        if twilio_client:
-            twilio_client.messages.create(
-                body=mensagem,
-                from_=f'whatsapp:{TWILIO_NUMBER}',
-                to=numero
-            )
-        return
-    
-    def enviar():
-        time.sleep(espera)
-        if twilio_client:
-            try:
-                twilio_client.messages.create(
-                    body=mensagem,
-                    from_=f'whatsapp:{TWILIO_NUMBER}',
-                    to=numero
-                )
-                print(f"✅ Lembrete enviado: {mensagem[:30]}")
-            except Exception as e:
-                print(f"❌ Erro ao enviar lembrete: {e}")
-    
-    threading.Thread(target=enviar, daemon=True).start()
+    try:
+        # Remove prefixo whatsapp: se existir
+        numero_limpo = numero.replace('whatsapp:', '')
+        if not numero_limpo.startswith('+'):
+            numero_limpo = '+' + numero_limpo
+        
+        msg = twilio_client.messages.create(
+            body=mensagem,
+            from_=f'whatsapp:{TWILIO_NUMBER}',
+            to=f'whatsapp:{numero_limpo}'
+        )
+        print(f"✅ WhatsApp enviado: {msg.sid}")
+        return True
+    except Exception as e:
+        print(f"❌ Erro Twilio: {e}")
+        return False
+
+def verificar_lembretes():
+    """Verifica a cada minuto se há lembretes para enviar"""
+    while True:
+        try:
+            agora = datetime.now()
+            # Busca eventos nos próximos 2 minutos
+            time_min = agora.isoformat() + 'Z'
+            time_max = (agora + timedelta(minutes=2)).isoformat() + 'Z'
+            
+            events = service.events().list(
+                calendarId=CAL_ID_LEMBRETES,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy='startTime',
+                q='[LEMBRETE]'  # Filtra só lembretes
+            ).execute()
+            
+            for event in events.get('items', []):
+                event_id = event.get('id')
+                
+                # Evita enviar duplicado
+                if event_id in lembretes_enviados:
+                    continue
+                
+                titulo = event.get('summary', '').replace('[LEMBRETE] ', '')
+                descricao = event.get('description', '')
+                numero = descricao.replace('Numero: ', '').strip()
+                
+                mensagem = f"⏰ *Lembrete!*\n\n*{titulo}*\n📅 Agora!"
+                
+                if enviar_whatsapp(numero, mensagem):
+                    lembretes_enviados.add(event_id)
+                    print(f"✅ Lembrete enviado: {titulo}")
+                    
+                    # Opcional: apagar o evento depois de enviar
+                    # service.events().delete(calendarId=CAL_ID_LEMBRETES, eventId=event_id).execute()
+                    
+        except Exception as e:
+            print(f"❌ Erro ao verificar lembretes: {e}")
+        
+        time.sleep(60)  # Verifica a cada 1 minuto
+
+# Inicia thread de verificação
+threading.Thread(target=verificar_lembretes, daemon=True).start()
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -131,37 +166,52 @@ def webhook():
     if msg.lower() in ['ajuda', 'help']:
         resp.message("""🤖 *Bot de Agenda*
 
-*Eventos (vão para Google Calendar):*
+*Eventos (Google Calendar):*
 • reunião amanhã 15h
-• médico segunda 14:30
-• academia hoje 18h vermelho
+• médico segunda 14:30 vermelho
 
-*Lembretes (mensagem no WhatsApp, não vai para agenda):*
+*Lembretes (alerta no WhatsApp):*
 • lembrete pagar conta amanhã 15h
-• lembrete reunião com João segunda 10h
+• lembrete reunião João segunda 10h
 
 *Cores:* vermelho, laranja, amarelo, verde, azul, roxo""")
         return str(resp)
     
     if not (p := parse(msg)):
-        resp.message("❓ Não entendi. Envie 'ajuda' para ver exemplos.")
+        resp.message("❓ Não entendi. Envie 'ajuda' para exemplos.")
         return str(resp)
     
     titulo, inicio, eh_lembrete, cor = p
     
     if eh_lembrete:
-        # Agenda mensagem para 15 minutos antes
-        horario_lembrete = inicio - timedelta(minutes=15)
+        # Cria evento no Google Calendar como "banco de dados"
+        # Será usado pela thread de verificação
+        evento = {
+            'summary': f'[LEMBRETE] {titulo}',
+            'description': f'Numero: {numero}',
+            'start': {'dateTime': inicio.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            'end': {'dateTime': (inicio + timedelta(minutes=1)).isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            'colorId': '5',  # Amarelo para lembretes
+            'reminders': {'useDefault': False}  # Sem lembrete do Google
+        }
         
-        mensagem_lembrete = f"⏰ *Lembrete:* {titulo}\n📅 {inicio.strftime('%d/%m/%Y %H:%M')}"
-        
-        enviar_lembrete(numero, mensagem_lembrete, horario_lembrete)
-        
-        emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor, '🔵')
-        resp.message(f"{emoji_cor} ⏰ *Lembrete agendado!*\n\n*{titulo}*\n📅 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n💬 Vou te avisar às {horario_lembrete.strftime('%H:%M')}")
-        
+        try:
+            ev = service.events().insert(calendarId=CAL_ID_LEMBRETES, body=evento).execute()
+            horario_envio = inicio - timedelta(minutes=0)  # Envia na hora (ou ajuste)
+            
+            resp.message(f"""⏰ *Lembrete agendado!*
+
+*{titulo}*
+📅 {inicio.strftime('%d/%m/%Y %H:%M')}
+
+💬 Vou te avisar por aqui na hora!
+
+✅ Salvo no calendário (ID: {ev['id'][:10]}...)""")
+        except Exception as e:
+            resp.message(f"❌ Erro ao salvar lembrete: {str(e)[:100]}")
+            
     else:
-        # Cria evento no Google Calendar
+        # Evento normal no Google Calendar
         evento = {
             'summary': titulo,
             'colorId': cor,
@@ -171,7 +221,7 @@ def webhook():
         }
         
         try:
-            ev = service.events().insert(calendarId=CAL_ID, body=evento).execute()
+            ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
             emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor, '🔵')
             resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
         except Exception as e:
@@ -181,7 +231,11 @@ def webhook():
 
 @app.route("/")
 def health():
-    return "OK"
+    return jsonify({
+        "status": "ok",
+        "twilio_configured": twilio_client is not None,
+        "timestamp": datetime.now().isoformat()
+    })
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
