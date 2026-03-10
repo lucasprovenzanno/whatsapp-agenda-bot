@@ -1,5 +1,6 @@
 import os, json, re, threading, time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -7,6 +8,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
+
+# Fuso horário de Brasília
+FUSO = ZoneInfo('America/Sao_Paulo')
 
 CAL_ID_EVENTOS = 'lucasprovenzano.cobeb@gmail.com'
 CAL_ID_LEMBRETES = 'lucas.provenzanno@gmail.com'
@@ -26,8 +30,12 @@ service = build('calendar', 'v3', credentials=creds)
 
 lembretes_enviados = set()
 
+def agora_sp():
+    """Retorna datetime atual no fuso de SP"""
+    return datetime.now(FUSO)
+
 def parse(msg):
-    hoje = datetime.now()
+    agora = agora_sp()
     msg_lower = msg.lower().strip()
     
     eh_lembrete = 'lembrete' in msg_lower
@@ -42,100 +50,97 @@ def parse(msg):
     
     msg_lower = re.sub(r'(lembrete|de\s+)', '', msg_lower).strip()
     
-    # DATA - ordem importante!
-    data = None
+    # DATA
+    data_hora = None
     
     # "daqui a X minutos/horas"
-    if m := re.search(r'daqui\s+a\s+(\d+)\s*(minutos?|mins?|h|horas?)', msg_lower):
+    if m := re.search(r'daqui\s+a\s+(\d+)\s*(minutos?|mins?|m\b|h|horas?)', msg_lower):
         quantidade = int(m.group(1))
         unidade = m.group(2)
-        if unidade.startswith('min') or unidade == 'm':
-            data = hoje + timedelta(minutes=quantidade)
+        if unidade.startswith('min') or unidade == 'm' or len(unidade) <= 2:
+            data_hora = agora + timedelta(minutes=quantidade)
         else:
-            data = hoje + timedelta(hours=quantidade)
+            data_hora = agora + timedelta(hours=quantidade)
         msg_lower = msg_lower.replace(m.group(0), '')
-        # Para "daqui a X minutos", usamos a hora atual + offset
-        return msg_lower.strip().title() or "Lembrete", data, eh_lembrete, cor
+        titulo = msg_lower.strip().title() or "Lembrete"
+        return titulo, data_hora, eh_lembrete, cor
     
     # "amanhã"
     elif 'amanhã' in msg_lower or 'amanha' in msg_lower:
-        data = hoje + timedelta(days=1)
+        data_base = agora + timedelta(days=1)
         msg_lower = re.sub(r'amanh[ãa]', '', msg_lower)
     
     # "hoje"
     elif 'hoje' in msg_lower:
-        data = hoje
+        data_base = agora
         msg_lower = msg_lower.replace('hoje', '')
     
     # dias da semana
     elif m := re.search(r'\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b', msg_lower):
         dias = {'segunda':0,'terça':1,'terca':1,'quarta':2,'quinta':3,'sexta':4,'sábado':5,'sabado':5,'domingo':6}
-        ate = (dias[m.group()] - hoje.weekday()) % 7 or 7
-        data = hoje + timedelta(days=ate)
+        ate = (dias[m.group()] - agora.weekday()) % 7 or 7
+        data_base = agora + timedelta(days=ate)
         msg_lower = msg_lower.replace(m.group(), '')
     
-    # data específica (dia 25, 25/03, etc) - só se não for "daqui a"
+    # data específica (25, 25/03)
     elif m := re.search(r'\b(\d{1,2})(?:/(\d{1,2}))?(?:/(\d{2,4}))?\b', msg_lower):
         dia = int(m.group(1))
-        mes = int(m.group(2)) if m.group(2) else hoje.month
-        ano = int(m.group(3)) if m.group(3) else hoje.year
+        mes = int(m.group(2)) if m.group(2) else agora.month
+        ano = int(m.group(3)) if m.group(3) else agora.year
         
-        # Ajusta ano de 2 dígitos
         if ano < 100:
             ano = 2000 + ano
         
         try:
-            data = datetime(ano, mes, dia)
-            # Se data já passou este ano, vai para próximo
-            if data.date() < hoje.date():
-                data = datetime(ano + 1, mes, dia)
+            data_base = datetime(ano, mes, dia, tzinfo=FUSO)
+            if data_base.date() < agora.date():
+                data_base = datetime(ano + 1, mes, dia, tzinfo=FUSO)
         except:
             return None
         msg_lower = msg_lower[:m.start()] + msg_lower[m.end():]
     
     else:
-        # Se não achou data e não é "daqui a", assume hoje
-        data = hoje
+        data_base = agora
     
-    # HORA
+    # HORA (padrão 9h se não especificar)
     hora, minuto = 9, 0
     
-    # Procura padrões de hora
     padroes = [
-        (r'(?:às\s*)?(\d{1,2}):(\d{2})', lambda m: (int(m.group(1)), int(m.group(2)))),  # 15:30
-        (r'(\d{1,2})h(\d{2})', lambda m: (int(m.group(1)), int(m.group(2)))),              # 15h30
-        (r'(\d{1,2})\s*(?:h|horas?)\b', lambda m: (int(m.group(1)), 0)),                  # 15h
-        (r'\b(?:às?\s+)(\d{1,2})\b', lambda m: (int(m.group(1)), 0)),                     # às 15
+        (r'(?:às\s*)?(\d{1,2}):(\d{2})', lambda m: (int(m.group(1)), int(m.group(2)))),
+        (r'(\d{1,2})h(\d{2})', lambda m: (int(m.group(1)), int(m.group(2)))),
+        (r'(\d{1,2})\s*(?:h|horas?)\b', lambda m: (int(m.group(1)), 0)),
+        (r'\b(?:às?\s+)(\d{1,2})\b', lambda m: (int(m.group(1)), 0)),
     ]
     
     for padrao, extrator in padroes:
         if m := re.search(padrao, msg_lower):
             hora, minuto = extrator(m)
             # Ajusta período
-            if 'tarde' in msg_lower and hora < 12:
+            msg_teste = msg_lower
+            if 'tarde' in msg_teste and hora < 12:
                 hora += 12
-            elif 'noite' in msg_lower and hora < 12:
+            elif 'noite' in msg_teste and hora < 12:
                 hora += 12
             msg_lower = msg_lower.replace(m.group(0), '')
             break
     
-    # Monta datetime final
-    inicio = data.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+    # Monta datetime com fuso SP
+    data_hora = data_base.replace(hour=hora, minute=minuto, second=0, microsecond=0, tzinfo=FUSO)
     
-    # Se já passou hoje (e não é lembrete com data específica), vai para amanhã
-    if inicio < hoje and not eh_lembrete:
-        inicio += timedelta(days=1)
+    # Se já passou, vai para amanhã (só se não for lembrete)
+    if data_hora < agora and not eh_lembrete:
+        data_hora += timedelta(days=1)
     
     # Título
     titulo = re.sub(r'\s+', ' ', msg_lower).strip().title()
     if len(titulo) < 2:
         titulo = "Lembrete" if eh_lembrete else "Evento"
     
-    return titulo, inicio, eh_lembrete, cor
+    return titulo, data_hora, eh_lembrete, cor
 
 def enviar_whatsapp(numero, mensagem):
     if not twilio_client:
-        print(f"❌ Twilio não configurado: {mensagem}")
+        print(f"❌ Twilio não configurado")
         return False
     try:
         numero_limpo = numero.replace('whatsapp:', '')
@@ -146,22 +151,22 @@ def enviar_whatsapp(numero, mensagem):
             from_=f'whatsapp:{TWILIO_NUMBER}',
             to=f'whatsapp:{numero_limpo}'
         )
-        print(f"✅ WhatsApp enviado: {msg.sid}")
+        print(f"✅ WhatsApp: {msg.sid}")
         return True
     except Exception as e:
         print(f"❌ Erro Twilio: {e}")
         return False
 
 def verificar_lembretes():
-    print("🔄 Thread de lembretes iniciada")
+    print("🔄 Thread lembretes iniciada")
     while True:
         try:
-            agora = datetime.now()
+            agora = agora_sp()
             # Busca eventos nos próximos 2 minutos
-            time_min = agora.isoformat() + 'Z'
-            time_max = (agora + timedelta(minutes=2)).isoformat() + 'Z'
+            time_min = agora.isoformat()
+            time_max = (agora + timedelta(minutes=2)).isoformat()
             
-            print(f"🔍 Verificando... {agora.strftime('%H:%M:%S')}")
+            print(f"🔍 {agora.strftime('%d/%m %H:%M:%S')}")
             
             events = service.events().list(
                 calendarId=CAL_ID_LEMBRETES,
@@ -172,7 +177,7 @@ def verificar_lembretes():
                 q='[LEMBRETE]'
             ).execute()
             
-            print(f"   Encontrados: {len(events.get('items', []))}")
+            print(f"   {len(events.get('items', []))} lembretes")
             
             for event in events.get('items', []):
                 event_id = event.get('id')
@@ -183,12 +188,11 @@ def verificar_lembretes():
                 descricao = event.get('description', '')
                 numero = descricao.replace('Numero: ', '').strip()
                 
-                mensagem = f"⏰ *Lembrete!*\n\n*{titulo}*\n⏰ {agora.strftime('%H:%M')}"
+                mensagem = f"⏰ *Lembrete!*\n\n*{titulo}*\n🕐 {agora.strftime('%H:%M')}"
                 
-                print(f"   📤 Enviando: {titulo}")
+                print(f"   📤 {titulo}")
                 if enviar_whatsapp(numero, mensagem):
                     lembretes_enviados.add(event_id)
-                    print(f"   ✅ OK!")
                     
         except Exception as e:
             print(f"❌ Erro: {e}")
@@ -204,7 +208,7 @@ def webhook():
     resp = MessagingResponse()
     
     if msg.lower() in ['ajuda', 'help']:
-        resp.message("""🤖 *Bot de Agenda*
+        resp.message("""🤖 *Bot de Agenda* (Horário SP)
 
 *Eventos:*
 • reunião amanhã 15h
@@ -223,8 +227,7 @@ def webhook():
     
     titulo, inicio, eh_lembrete, cor = p
     
-    # Debug
-    print(f"📝 Parsed: {titulo} | {inicio} | Lembrete: {eh_lembrete}")
+    print(f"📝 {titulo} | {inicio.strftime('%d/%m %H:%M')} | Lembrete:{eh_lembrete}")
     
     if eh_lembrete:
         evento = {
@@ -241,9 +244,9 @@ def webhook():
             resp.message(f"""⏰ *Lembrete agendado!*
 
 *{titulo}*
-📅 {inicio.strftime('%d/%m/%Y %H:%M')}
+📅 {inicio.strftime('%d/%m/%Y %H:%M')} (SP)
 
-💬 Vou te avisar na hora!""")
+💬 Te aviso na hora!""")
         except Exception as e:
             resp.message(f"❌ Erro: {str(e)[:100]}")
     else:
@@ -258,7 +261,7 @@ def webhook():
         try:
             ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
             emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor, '🔵')
-            resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
+            resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')} (SP)\n\n🔗 {ev.get('htmlLink')}")
         except Exception as e:
             resp.message(f"❌ Erro: {str(e)[:100]}")
     
@@ -266,7 +269,12 @@ def webhook():
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "twilio": twilio_client is not None})
+    agora = agora_sp()
+    return jsonify({
+        "status": "ok",
+        "hora_sp": agora.strftime('%d/%m %H:%M:%S'),
+        "twilio": twilio_client is not None
+    })
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
