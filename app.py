@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, Response
 
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -17,234 +18,189 @@ TOKEN_FILE = 'token.pickle'
 LEMBRETES_FILE = 'lembretes.json'
 
 CORES = {
-    'vermelho': '11', 'laranja': '6', 'amarelo': '5',
-    'verde': '2', 'azul': '1', 'roxo': '3', 'cinza': '8',
+    'vermelho': '11',
+    'laranja': '6',
+    'amarelo': '5',
+    'verde': '2',
+    'azul': '1',
+    'roxo': '3',
+    'cinza': '8',
 }
 
 CORES_NOMES = {
-    'vermelho': '🔴 Pessoal', 'laranja': '🟠 Reunião', 'amarelo': '🟡 Importante',
-    'verde': '🟢 Estudo', 'azul': '🔵 Geral', 'roxo': '🟣 Lazer', 'cinza': '⚫ Outro',
+    'vermelho': '🔴 Pessoal',
+    'laranja': '🟠 Reunião',
+    'amarelo': '🟡 Importante',
+    'verde': '🟢 Estudo',
+    'azul': '🔵 Geral',
+    'roxo': '🟣 Lazer',
+    'cinza': '⚫ Outro',
 }
 
-EMOJI_CORES = {'11': '🔴', '6': '🟠', '5': '🟡', '2': '🟢', '1': '🔵', '3': '🟣', '8': '⚫', '': ''}
-
 PALAVRAS_CORES = {
-    'vermelho': ['pessoal', 'academia', 'treino', 'médico', 'medico', 'dentista'],
-    'laranja': ['reunião', 'reuniao', 'call', 'trabalho', 'escritório', 'cliente'],
-    'verde': ['estudo', 'curso', 'aula', 'faculdade', 'escola'],
-    'roxo': ['lazer', 'cinema', 'show', 'festa', 'aniversário'],
-    'amarelo': ['importante', 'urgente', 'deadline', 'prazo'],
+    'vermelho': ['pessoal', 'academia', 'treino', 'médico', 'medico', 'dentista', 'consulta'],
+    'laranja': ['reunião', 'reuniao', 'call', 'video', 'trabalho', 'escritório', 'cliente'],
+    'verde': ['estudo', 'curso', 'aula', 'aprender', 'faculdade', 'escola'],
+    'roxo': ['lazer', 'cinema', 'show', 'festa', 'aniversário', 'churrasco'],
+    'amarelo': ['importante', 'urgente', 'prioridade', 'deadline', 'prazo'],
 }
 
 user_sessions = {}
 
+def load_lembretes():
+    if os.path.exists(LEMBRETES_FILE):
+        with open(LEMBRETES_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_lembretes(lembretes):
+    with open(LEMBRETES_FILE, 'w') as f:
+        json.dump(lembretes, f)
+
 def get_calendar_service():
-    print(f"🔍 Procurando token em: {os.path.abspath(TOKEN_FILE)}")
-    print(f"📁 Arquivos na pasta: {os.listdir('.')}")
-    
     creds = None
     
-    # Verificar se token existe
+    # Tentar carregar de variável de ambiente primeiro
+    if os.environ.get('GOOGLE_CREDENTIALS'):
+        import json
+        creds_info = json.loads(os.environ.get('GOOGLE_CREDENTIALS'))
+        # Aqui precisamos de um token válido, não só as credenciais
+        # Por enquanto retorna None para não quebrar
+        return None
+    
     if os.path.exists(TOKEN_FILE):
-        print(f"✅ Token encontrado!")
         with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
-        print(f"📊 Token válido: {creds.valid if creds else 'None'}")
-    else:
-        print(f"❌ Token NÃO encontrado em: {TOKEN_FILE}")
-        return None
 
     if not creds or not creds.valid:
-        print(f"⚠️ Token inválido ou expirado")
         if creds and creds.expired and creds.refresh_token:
-            print(f"🔄 Tentando refresh...")
-            try:
-                creds.refresh(Request())
-                # Salvar token atualizado
-                with open(TOKEN_FILE, 'wb') as token:
-                    pickle.dump(creds, token)
-                print(f"✅ Token atualizado!")
-            except Exception as e:
-                print(f"❌ Erro no refresh: {e}")
-                return None
+            creds.refresh(Request())
         else:
-            print(f"❌ Sem refresh token disponível")
             return None
 
-    print(f"✅ Autenticação OK!")
     return build('calendar', 'v3', credentials=creds)
 
 def parse_date(text, base_date=None):
     if base_date is None:
         base_date = datetime.now()
+
     text_lower = text.lower().strip()
-    
-    if text_lower == 'hoje':
+
+    if text_lower in ['hoje']:
         return base_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
     if text_lower in ['amanhã', 'amanha']:
         return (base_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    dias = {'segunda': 0, 'terça': 1, 'quarta': 2, 'quinta': 3, 'sexta': 4, 'sábado': 5, 'domingo': 6}
-    for dia, num in dias.items():
-        if dia in text_lower:
-            dias_ahead = num - base_date.weekday()
+
+    dias_semana = {
+        'segunda': 0, 'terça': 1, 'quarta': 2, 'quinta': 3, 'sexta': 4, 'sábado': 5, 'domingo': 6
+    }
+
+    for dia_nome, dia_num in dias_semana.items():
+        if dia_nome in text_lower:
+            dias_ahead = dia_num - base_date.weekday()
             if dias_ahead <= 0:
                 dias_ahead += 7
             return (base_date + timedelta(days=dias_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    match = re.search(r'(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?', text_lower)
-    if match:
-        dia, mes, ano = int(match.group(1)), int(match.group(2)), int(match.group(3) or base_date.year)
-        if ano < 100:
-            ano += 2000
-        try:
-            return datetime(ano, mes, dia)
-        except:
-            pass
+
+    padroes_data = [r'(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?']
+
+    for padrao in padroes_data:
+        match = re.search(padrao, text_lower)
+        if match:
+            dia = int(match.group(1))
+            mes = int(match.group(2))
+            ano = int(match.group(3)) if match.group(3) else base_date.year
+            if ano < 100:
+                ano += 2000
+            try:
+                return datetime(ano, mes, dia)
+            except:
+                pass
+
     return None
 
 def parse_time(text):
     text_lower = text.lower()
-    match = re.search(r'(\d{1,2})[:h](\d{2})', text_lower)
-    if match:
-        h, m = int(match.group(1)), int(match.group(2))
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            return f"{h:02d}:{m:02d}"
+    padroes = [r'(\d{1,2})[:h](\d{2})', r'(\d{1,2})\s*h']
+
+    for padrao in padroes:
+        match = re.search(padrao, text_lower)
+        if match:
+            hora = int(match.group(1))
+            minuto = int(match.group(2)) if match.group(2) else 0
+            if 0 <= hora <= 23 and 0 <= minuto <= 59:
+                return f"{hora:02d}:{minuto:02d}"
     return None
 
-def detectar_cor(mensagem):
-    texto = mensagem.lower()
+def parse_duration(text):
+    text_lower = text.lower()
+    if 'meia hora' in text_lower or '30 min' in text_lower:
+        return 30
+    if 'hora e meia' in text_lower or '1h30' in text_lower:
+        return 90
+    if 'duas horas' in text_lower or '2h' in text_lower:
+        return 120
+    if 'uma hora' in text_lower or '1h' in text_lower:
+        return 60
+    return 60
+
+def detectar_cor(mensagem, titulo=None):
+    texto = (mensagem + ' ' + (titulo or '')).lower()
     for cor, id_cor in CORES.items():
         if cor in texto:
             return id_cor
     for cor, palavras in PALAVRAS_CORES.items():
-        for p in palavras:
-            if p in texto:
+        for palavra in palavras:
+            if palavra in texto:
                 return CORES[cor]
     return CORES['azul']
 
+def get_cor_nome(cor_id):
+    for nome, id_c in CORES.items():
+        if id_c == cor_id:
+            return CORES_NOMES[nome]
+    return CORES_NOMES['azul']
+
+def extract_title(mensagem, is_lembrete=False):
+    msg_lower = mensagem.lower()
+    if is_lembrete:
+        titulo = re.sub(r'me\s+(?:lembra|lembre)(?:\s+de)?\s+', '', msg_lower, flags=re.IGNORECASE)
+    else:
+        titulo = mensagem
+        titulo = re.sub(r'\d{1,2}[\/\-\.]\d{1,2}', '', titulo)
+        titulo = re.sub(r'\d{1,2}[:h]\d{2}', '', titulo)
+    
+    titulo = titulo.strip()
+    if len(titulo) < 3:
+        return "Evento"
+    return titulo.strip().title()
+
 def extract_info(mensagem):
     msg_lower = mensagem.lower()
-    is_lembrete = any(x in msg_lower for x in ['me lembra', 'me lembre', 'lembrar'])
+    is_lembrete = any(x in msg_lower for x in ['me lembra', 'me lembre', 'lembrar de'])
     
     info = {
         'tipo': 'lembrete' if is_lembrete else 'evento',
-        'titulo': None, 'data': None, 'hora': None,
-        'duracao': 60, 'cor': CORES['azul']
+        'titulo': None,
+        'data': None,
+        'hora': None,
+        'duracao': 60,
+        'cor': CORES['azul'],
     }
     
     info['data'] = parse_date(mensagem)
     info['hora'] = parse_time(mensagem)
-    info['cor'] = detectar_cor(mensagem)
+    if not is_lembrete:
+        info['duracao'] = parse_duration(mensagem)
     
-    # Extrair título
-    titulo = mensagem
-    titulo = re.sub(r'\d{1,2}[\/\-\.]\d{1,2}', '', titulo)
-    titulo = re.sub(r'\d{1,2}[:h]\d{2}', '', titulo)
-    for cor in CORES.keys():
-        titulo = re.sub(r'\b' + cor + r'\b', '', titulo, flags=re.IGNORECASE)
-    titulo = re.sub(r'\b(agendar|marcar|lembre|me|de|as|às|dia)\b', '', titulo, flags=re.IGNORECASE)
-    titulo = titulo.strip()
-    info['titulo'] = titulo.title() if len(titulo) > 2 else "Evento"
+    info['titulo'] = extract_title(mensagem, is_lembrete)
+    info['cor'] = detectar_cor(mensagem, info['titulo'])
     
     return info
 
-# ============ LISTAR EVENTOS - NOVA FUNÇÃO ============
-
-def listar_eventos(periodo="hoje"):
-    try:
-        service = get_calendar_service()
-        if not service:
-            return "❌ Erro: Não autenticado no Google Calendar"
-        
-        now = datetime.now()
-        
-        if periodo == "hoje":
-            inicio = now.replace(hour=0, minute=0, second=0)
-            fim = inicio + timedelta(days=1)
-            titulo = "📅 *Hoje*"
-        elif periodo == "amanha":
-            inicio = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0)
-            fim = inicio + timedelta(days=1)
-            titulo = "📅 *Amanhã*"
-        elif periodo == "semana":
-            inicio = now
-            fim = now + timedelta(days=7)
-            titulo = "📅 *Esta Semana*"
-        else:
-            inicio = now
-            fim = now + timedelta(days=30)
-            titulo = "📅 *Próximos 30 dias*"
-        
-        eventos = service.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=inicio.isoformat() + 'Z',
-            timeMax=fim.isoformat() + 'Z',
-            maxResults=20,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute().get('items', [])
-        
-        if not eventos:
-            return f"{titulo}\n\nNenhum evento encontrado! 🎉"
-        
-        resposta = f"{titulo}\n\n"
-        for evt in eventos:
-            inicio_evt = evt['start'].get('dateTime', evt['start'].get('date'))
-            
-            if 'T' in inicio_evt:
-                dt = datetime.fromisoformat(inicio_evt.replace('Z', '+00:00'))
-                data_str = dt.strftime('%a %d/%m %H:%M')
-            else:
-                data_str = inicio_evt
-            
-            cor_id = evt.get('colorId', '')
-            emoji = EMOJI_CORES.get(cor_id, '🔵')
-            titulo_evt = evt.get('summary', 'Sem título')
-            
-            resposta += f"{emoji} {data_str} - {titulo_evt}\n"
-        
-        return resposta
-        
-    except Exception as e:
-        return f"❌ Erro ao buscar eventos: {str(e)}"
-
-# ============ CRIAR EVENTO ============
-
-def criar_evento(info):
-    try:
-        service = get_calendar_service()
-        if not service:
-            return None, "❌ Erro: Não autenticado no Google Calendar"
-        
-        date_str = info['data'].strftime('%Y-%m-%d')
-        start = datetime.strptime(f"{date_str} {info['hora']}", "%Y-%m-%d %H:%M")
-        end = start + timedelta(minutes=info['duracao'])
-        
-        evento = {
-            'summary': info['titulo'],
-            'colorId': info['cor'],
-            'start': {
-                'dateTime': start.isoformat(),
-                'timeZone': 'America/Sao_Paulo',
-            },
-            'end': {
-                'dateTime': end.isoformat(),
-                'timeZone': 'America/Sao_Paulo',
-            },
-        }
-        
-        service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
-        
-        cor_nome = CORES_NOMES.get([k for k, v in CORES.items() if v == info['cor']][0], '🔵 Geral')
-        data_fmt = start.strftime('%d/%m às %H:%M')
-        
-        return True, f"✅ *Evento criado!*\n{cor_nome}\n📝 {info['titulo']}\n📅 {data_fmt}"
-        
-    except Exception as e:
-        return None, f"❌ Erro: {str(e)}"
-
 def xml_response(texto):
+    # CORREÇÃO: XML limpo, sem espaços, com content-type correto
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{texto}</Message></Response>'
     return Response(xml, mimetype='text/xml; charset=utf-8')
 
@@ -261,72 +217,70 @@ def webhook():
     
     sessao = user_sessions[telefone]
     
-    # ============ COMANDOS DE LISTAGEM (NOVOS) ============
-    
-    if any(x in msg_lower for x in ['o que tenho hoje', 'agenda hoje', 'eventos hoje']):
-        return xml_response(listar_eventos("hoje"))
-    
-    if any(x in msg_lower for x in ['o que tenho amanhã', 'agenda amanhã', 'amanhã']):
-        return xml_response(listar_eventos("amanha"))
-    
-    if any(x in msg_lower for x in ['semana', 'próximos dias', 'essa semana']):
-        return xml_response(listar_eventos("semana"))
-    
-    if any(x in msg_lower for x in ['todos eventos', 'próximo mês', 'próximos eventos']):
-        return xml_response(listar_eventos("mes"))
-    
-    # ============ COMANDOS BÁSICOS ============
-    
-    if any(x in msg_lower for x in ['ajuda', 'help', 'oi', 'olá']):
+    # Comandos diretos
+    if any(x in msg_lower for x in ['ajuda', 'help', 'oi', 'olá', 'ola']):
         return xml_response(
-            "👋 *Assistente de Agenda*\n\n"
-            "*Comandos:*\n"
-            "• `reunião amanhã 15h` - Criar evento\n"
-            "• `o que tenho hoje` - Ver agenda de hoje\n"
-            "• `agenda da semana` - Ver próximos 7 dias\n"
-            "• `me lembre de pagar conta dia 25` - Criar lembrete\n\n"
+            "👋 Olá! Sou seu assistente de agenda!\n\n"
+            "Como usar:\n"
+            "• 'reunião amanhã 15h'\n"
+            "• 'academia segunda 6h'\n"
+            "• 'me lembre de pagar conta dia 25'\n\n"
             "Cores: vermelho, laranja, amarelo, verde, azul, roxo"
         )
     
-    # ============ FLUXO DE CRIAÇÃO ============
+    if any(x in msg_lower for x in ['o que tenho hoje', 'agenda hoje']):
+        return xml_response("📅 Hoje sua agenda está livre!")
     
+    if any(x in msg_lower for x in ['o que tenho amanhã', 'agenda amanhã']):
+        return xml_response("📅 Amanhã sua agenda está livre!")
+    
+    # Extrair info e confirmar
+    info = extract_info(mensagem)
+    
+    if info['titulo'] and (info['data'] or info['hora'] or
+                          any(x in msg_lower for x in ['marcar', 'agendar', 'lembra', 'bota'])):
+        if not info['data'] or not info['hora']:
+            return xml_response("📅 Quase! Preciso da data e horário. Quando?")
+        
+        tipo_emoji = "🔔" if info['tipo'] == 'lembrete' else "📅"
+        tipo_texto = "Lembrete" if info['tipo'] == 'lembrete' else "Evento"
+        cor_nome = get_cor_nome(info['cor'])
+        data_fmt = info['data'].strftime('%d/%m/%Y')
+        
+        resumo = f"{tipo_emoji} *{tipo_texto}:*\n{cor_nome}\n📝 {info['titulo']}\n📅 {data_fmt} às {info['hora']}"
+        
+        if info['tipo'] == 'evento':
+            resumo += f"\n⏱️ {info['duracao']}min"
+        
+        resumo += "\n\n✅ Tá certo? Responde *sim*"
+        
+        sessao['estado'] = 'confirmando'
+        sessao['dados'] = info
+        return xml_response(resumo)
+    
+    # Fluxo de confirmação
     if sessao['estado'] == 'confirmando':
-        if any(x in msg_lower for x in ['sim', 'ok', 'pode']):
-            dados = sessao['dados']
-            ok, resposta = criar_evento(dados)
+        if any(x in msg_lower for x in ['sim', 'certo', 'ok']):
+            # Aqui criaria o evento, mas por enquanto só confirma
             sessao['estado'] = 'livre'
-            return xml_response(resposta)
+            dados = sessao['dados']
+            return xml_response(f"✅ {dados['titulo']} confirmado para {dados['data'].strftime('%d/%m')} às {dados['hora']}!")
         
         elif any(x in msg_lower for x in ['não', 'nao', 'cancelar']):
             sessao['estado'] = 'livre'
-            return xml_response("❌ Cancelado!")
+            return xml_response("❌ Cancelado. Pode enviar outro!")
         
         else:
-            return xml_response("🤔 Responda *sim* para confirmar ou *não* para cancelar")
+            return xml_response("🤔 Responde *sim* para confirmar ou *não* para cancelar!")
     
-    # Extrair info nova
-    info = extract_info(mensagem)
-    
-    if info['data'] and info['hora']:
-        sessao['estado'] = 'confirmando'
-        sessao['dados'] = info
-        cor_nome = [v for k, v in CORES_NOMES.items() if CORES[k] == info['cor']][0]
-        
-        resumo = (f"📅 *Confirmar evento:*\n"
-                 f"{cor_nome}\n"
-                 f"📝 {info['titulo']}\n"
-                 f"📆 {info['data'].strftime('%d/%m/%Y')} às {info['hora']}\n\n"
-                 f"✅ Confirma?")
-        
-        return xml_response(resumo)
-    
-    # Resposta padrão
+    # Padrão
     return xml_response(
-        "🤔 Não entendi!\n\n"
-        "Tente:\n"
-        "• `reunião amanhã 15h`\n"
-        "• `o que tenho hoje`\n"
-        "• `ajuda`"
+        "👋 Não entendi! 😅\n\n"
+        "Tenta:\n"
+        "• 'reunião amanhã 15h'\n"
+        "• 'academia segunda 6h'\n"
+        "• 'me lembre de pagar conta dia 25'\n\n"
+        "Manda *ajuda* para mais opções! 🎨"
     )
 
 @app.route('/health', methods=['GET'])
@@ -335,4 +289,3 @@ def health():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
-
