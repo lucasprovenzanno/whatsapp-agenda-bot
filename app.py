@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# Configuração do Service Account
+# Configuração
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 CALENDAR_ID = 'primary'
 SERVICE_ACCOUNT_FILE = 'service_account.json'
@@ -36,11 +36,27 @@ user_sessions = {}
 
 def get_calendar_service():
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        # Tentar carregar de variável de ambiente primeiro
+        service_account_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT')
+        
+        if service_account_json:
+            print("🔍 Usando variável de ambiente")
+            service_account_info = json.loads(service_account_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info, scopes=SCOPES)
+        elif os.path.exists(SERVICE_ACCOUNT_FILE):
+            print("🔍 Usando arquivo")
+            credentials = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        else:
+            print("❌ Nenhuma credencial encontrada")
+            return None
+            
+        print("✅ Credenciais carregadas")
         return build('calendar', 'v3', credentials=credentials)
+        
     except Exception as e:
-        print(f"❌ Erro na autenticação: {e}")
+        print(f"❌ Erro: {str(e)}")
         return None
 
 def parse_date(text, base_date=None):
@@ -121,7 +137,7 @@ def criar_evento(info):
     try:
         service = get_calendar_service()
         if not service:
-            return None, "❌ Erro: Não foi possível conectar ao Google Calendar"
+            return None, "❌ Erro: Não autenticado no Google Calendar"
         
         date_str = info['data'].strftime('%Y-%m-%d')
         start = datetime.strptime(f"{date_str} {info['hora']}", "%Y-%m-%d %H:%M")
