@@ -39,15 +39,39 @@ PALAVRAS_CORES = {
 user_sessions = {}
 
 def get_calendar_service():
+    print(f"🔍 Procurando token em: {os.path.abspath(TOKEN_FILE)}")
+    print(f"📁 Arquivos na pasta: {os.listdir('.')}")
+    
     creds = None
+    
+    # Verificar se token existe
     if os.path.exists(TOKEN_FILE):
+        print(f"✅ Token encontrado!")
         with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
+        print(f"📊 Token válido: {creds.valid if creds else 'None'}")
+    else:
+        print(f"❌ Token NÃO encontrado em: {TOKEN_FILE}")
+        return None
+
     if not creds or not creds.valid:
+        print(f"⚠️ Token inválido ou expirado")
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            print(f"🔄 Tentando refresh...")
+            try:
+                creds.refresh(Request())
+                # Salvar token atualizado
+                with open(TOKEN_FILE, 'wb') as token:
+                    pickle.dump(creds, token)
+                print(f"✅ Token atualizado!")
+            except Exception as e:
+                print(f"❌ Erro no refresh: {e}")
+                return None
         else:
+            print(f"❌ Sem refresh token disponível")
             return None
+
+    print(f"✅ Autenticação OK!")
     return build('calendar', 'v3', credentials=creds)
 
 def parse_date(text, base_date=None):
@@ -311,3 +335,4 @@ def health():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
+
