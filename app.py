@@ -7,7 +7,128 @@ from twilio.rest import Client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+# ==========================================
+# [NOVO] 1. LOGS ESTRUTURADOS
+# ==========================================
+import logging
+import sys
+from pythonjsonlogger import jsonlogger
+
+class CustomJsonFormatter(jsonlogger.JsonFormatter):
+    def add_fields(self, log_record, record, message_dict):
+        super(CustomJsonFormatter, self).add_fields(log_record, record, message_dict)
+        log_record['timestamp'] = datetime.now().isoformat()
+        log_record['level'] = record.levelname
+        log_record['service'] = 'whatsapp-calendar-bot'
+
+def setup_logging():
+    logHandler = logging.StreamHandler(sys.stdout)
+    formatter = CustomJsonFormatter('%(timestamp)s %(level)s %(service)s %(message)s')
+    logHandler.setFormatter(formatter)
+    
+    logger = logging.getLogger()
+    logger.addHandler(logHandler)
+    logger.setLevel(logging.INFO)
+    return logger
+
+logger = setup_logging()
+
+# ==========================================
+# [NOVO] 2. REDIS E RATE LIMITING
+# ==========================================
+import redis
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
 app = Flask(__name__)
+
+# Redis client (usa variável de ambiente REDIS_URL)
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+try:
+    redis_client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5)
+    redis_client.ping()  # Testa conexão
+    logger.info("Redis conectado", extra={"url": redis_url.replace(redis_url.split('@')[0], 'redis://***')})
+except Exception as e:
+    logger.error("Falha ao conectar Redis", extra={"error": str(e)})
+    # Fallback para memória local (apenas para desenvolvimento)
+    redis_client = None
+    logger.warning("Usando fallback em memória - sessões não persistirão restart")
+
+# Rate Limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    storage_uri=redis_url if redis_client else "memory://",
+    default_limits=["100 per day", "30 per hour"],
+    strategy="fixed-window"
+)
+
+# ==========================================
+# [NOVO] 3. GERENCIADOR DE SESSÕES COM REDIS
+# ==========================================
+
+class SessionManager:
+    """Gerencia sessões de edição/cancelamento com Redis + fallback memória"""
+    
+    def __init__(self, redis_client, timeout=300):
+        self.redis = redis_client
+        self.timeout = timeout  # 5 minutos
+        self.fallback = {}  # Fallback local se Redis falhar
+    
+    def _key(self, user_id, session_type):
+        return f"session:{session_type}:{user_id}"
+    
+    def set(self, user_id, session_type, data):
+        key = self._key(user_id, session_type)
+        data['_timestamp'] = datetime.now().isoformat()
+        
+        if self.redis:
+            try:
+                self.redis.setex(key, self.timeout, json.dumps(data))
+                logger.info("Sessão criada", extra={
+                    "user": user_id, 
+                    "type": session_type,
+                    "ttl": self.timeout
+                })
+                return
+            except Exception as e:
+                logger.error("Redis falhou, usando fallback", extra={"error": str(e)})
+        
+        # Fallback para memória
+        self.fallback[key] = data
+        logger.info("Sessão criada (fallback)", extra={"user": user_id, "type": session_type})
+    
+    def get(self, user_id, session_type):
+        key = self._key(user_id, session_type)
+        
+        if self.redis:
+            try:
+                data = self.redis.get(key)
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.error("Redis falhou no get", extra={"error": str(e)})
+        
+        # Fallback
+        return self.fallback.get(key)
+    
+    def delete(self, user_id, session_type):
+        key = self._key(user_id, session_type)
+        
+        if self.redis:
+            try:
+                self.redis.delete(key)
+            except Exception as e:
+                logger.error("Redis falhou no delete", extra={"error": str(e)})
+        
+        self.fallback.pop(key, None)
+        logger.info("Sessão removida", extra={"user": user_id, "type": session_type})
+    
+    def exists(self, user_id, session_type):
+        return self.get(user_id, session_type) is not None
+
+# Instanciar gerenciador
+session_manager = SessionManager(redis_client, timeout=300)
 
 FUSO = ZoneInfo('America/Sao_Paulo')
 
@@ -30,12 +151,13 @@ service = build('calendar', 'v3', credentials=creds)
 
 lembretes_enviados = set()
 
+# [NOVO] Variáveis globais removidas - agora usam SessionManager
+# user_cancel_sessions = {}  # REMOVIDO
+# user_edit_sessions = {}    # REMOVIDO
+
 # ==========================================
 # FUNÇÕES AUXILIARES COMPARTILHADAS
 # ==========================================
-
-user_cancel_sessions = {}
-user_edit_sessions = {}
 
 def formatar_data_br(start_dict):
     """Converte data do Google Calendar para formato amigável em PT-BR"""
@@ -100,7 +222,7 @@ def extrair_hora_de_string(texto):
     return None, None
 
 # ==========================================
-# 1. RESUMO DO DIA ESPECÍFICO (EXISTENTE)
+# 1. RESUMO DO DIA ESPECÍFICO
 # ==========================================
 
 def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
@@ -164,7 +286,7 @@ def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
         return mensagem
         
     except Exception as e:
-        print(f"Erro no resumo do dia: {e}")
+        logger.error("Erro no resumo do dia", extra={"error": str(e), "dias_futuro": dias_futuro})
         return '❌ Erro ao buscar agenda. Tente novamente.'
 
 
@@ -222,7 +344,7 @@ def parse_data_manual(dia, mes, ano_str=None):
         return None
 
 # ==========================================
-# 2. EDIÇÃO DE EVENTOS (NOVO - CORRIGIDO)
+# 2. EDIÇÃO DE EVENTOS (ATUALIZADO PARA REDIS)
 # ==========================================
 
 def listar_eventos_para_editar(phone_number):
@@ -247,13 +369,13 @@ def listar_eventos_para_editar(phone_number):
         if not eventos:
             return '✅ Não há eventos nos próximos 7 dias para editar.'
         
-        user_edit_sessions[phone_number] = {
+        # [NOVO] Usa SessionManager em vez de dicionário global
+        session_manager.set(phone_number, 'edicao', {
             'eventos': eventos,
-            'timestamp': datetime.now(),
             'etapa': 'escolher_evento',
             'evento_selecionado': None,
             'campo_para_editar': None
-        }
+        })
         
         mensagem = '✏️ *Qual evento deseja editar?*\n\n'
         
@@ -267,21 +389,18 @@ def listar_eventos_para_editar(phone_number):
         return mensagem
         
     except Exception as e:
-        print(f"Erro ao listar para editar: {e}")
+        logger.error("Erro ao listar para editar", extra={"user": phone_number, "error": str(e)})
         return '❌ Erro ao buscar eventos. Tente novamente.'
 
 
 def iniciar_edicao_evento(phone_number, numero_escolhido):
     """Inicia o processo de edição após usuário escolher número"""
     
-    sessao = user_edit_sessions.get(phone_number)
+    # [NOVO] Busca do SessionManager
+    sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao:
         return '⚠️ Sessão expirada. Envie *editar* para começar novamente.'
-    
-    if datetime.now() - sessao['timestamp'] > timedelta(minutes=5):
-        user_edit_sessions.pop(phone_number, None)
-        return '⏰ Tempo expirado. Envie *editar* para começar novamente.'
     
     eventos = sessao['eventos']
     indice = numero_escolhido - 1
@@ -290,9 +409,11 @@ def iniciar_edicao_evento(phone_number, numero_escolhido):
         return f'❌ Número inválido. Escolha entre 1 e {len(eventos)}.'
     
     evento = eventos[indice]
+    
+    # [NOVO] Atualiza sessão
     sessao['evento_selecionado'] = evento
     sessao['etapa'] = 'escolher_campo'
-    sessao['timestamp'] = datetime.now()
+    session_manager.set(phone_number, 'edicao', sessao)
     
     titulo = evento.get('summary', 'Sem título')
     hora_atual = formatar_data_br(evento['start'])
@@ -313,35 +434,32 @@ def iniciar_edicao_evento(phone_number, numero_escolhido):
 def processar_escolha_edicao(phone_number, escolha):
     """Processa escolha do campo a editar (1=horário, 2=título, 3=cor)"""
     
-    sessao = user_edit_sessions.get(phone_number)
+    # [NOVO] Busca do SessionManager
+    sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao or sessao['etapa'] != 'escolher_campo':
         return None
-    
-    if datetime.now() - sessao['timestamp'] > timedelta(minutes=5):
-        user_edit_sessions.pop(phone_number, None)
-        return '⏰ Tempo expirado. Envie *editar* para começar novamente.'
     
     evento = sessao['evento_selecionado']
     
     if escolha == '1':
         sessao['campo_para_editar'] = 'horario'
         sessao['etapa'] = 'aguardar_valor'
-        sessao['timestamp'] = datetime.now()
+        session_manager.set(phone_number, 'edicao', sessao)
         hora_atual = formatar_data_br(evento['start'])
         return f'⏰ *Alterar horário*\nAtual: {hora_atual}\n\nQual o novo horário?\n_(ex: 16h, 14:30, 9h da manhã)_'
     
     elif escolha == '2':
         sessao['campo_para_editar'] = 'titulo'
         sessao['etapa'] = 'aguardar_valor'
-        sessao['timestamp'] = datetime.now()
+        session_manager.set(phone_number, 'edicao', sessao)
         titulo_atual = evento.get('summary', 'Sem título')
         return f'📝 *Alterar título*\nAtual: {titulo_atual}\n\nQual o novo título?'
     
     elif escolha == '3':
         sessao['campo_para_editar'] = 'cor'
         sessao['etapa'] = 'aguardar_valor'
-        sessao['timestamp'] = datetime.now()
+        session_manager.set(phone_number, 'edicao', sessao)
         cor_atual = CORES_INVERTIDO.get(evento.get('colorId', '9'), 'azul')
         return f'🎨 *Alterar cor*\nAtual: {cor_atual}\n\nOpções: vermelho, laranja, amarelo, verde, azul, roxo\n\nQual a nova cor?'
     
@@ -352,7 +470,8 @@ def processar_escolha_edicao(phone_number, escolha):
 def aplicar_edicao(phone_number, valor_informado):
     """Aplica a edição no Google Calendar"""
     
-    sessao = user_edit_sessions.get(phone_number)
+    # [NOVO] Busca do SessionManager
+    sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao or sessao['etapa'] != 'aguardar_valor':
         return None
@@ -436,17 +555,23 @@ def aplicar_edicao(phone_number, valor_informado):
             body=evento_atual
         ).execute()
         
-        # Limpa sessão
-        user_edit_sessions.pop(phone_number, None)
+        # [NOVO] Limpa sessão do Redis
+        session_manager.delete(phone_number, 'edicao')
+        
+        logger.info("Edição aplicada", extra={
+            "user": phone_number,
+            "event_id": event_id,
+            "campo": campo
+        })
         
         return f'✅ *Edição concluída!*\n\n{resultado}'
         
     except Exception as e:
-        print(f"Erro ao editar: {e}")
+        logger.error("Erro ao editar", extra={"user": phone_number, "error": str(e)})
         return '❌ Erro ao aplicar edição. Tente novamente.'
 
 # ==========================================
-# SISTEMA DE CANCELAMENTO (EXISTENTE)
+# SISTEMA DE CANCELAMENTO (ATUALIZADO PARA REDIS)
 # ==========================================
 
 def listar_eventos_cancelar(phone_number):
@@ -471,10 +596,10 @@ def listar_eventos_cancelar(phone_number):
         if not eventos:
             return '✅ Não há eventos nos próximos 7 dias para cancelar.'
         
-        user_cancel_sessions[phone_number] = {
-            'eventos': eventos,
-            'timestamp': datetime.now()
-        }
+        # [NOVO] Usa SessionManager
+        session_manager.set(phone_number, 'cancelamento', {
+            'eventos': eventos
+        })
         
         mensagem = '🗑️ *Eventos dos próximos 7 dias:*\n\n'
         
@@ -488,21 +613,18 @@ def listar_eventos_cancelar(phone_number):
         return mensagem
         
     except Exception as e:
-        print(f"Erro ao listar: {e}")
+        logger.error("Erro ao listar cancelamento", extra={"user": phone_number, "error": str(e)})
         return '❌ Erro ao buscar eventos. Tente novamente.'
 
 
 def confirmar_cancelamento(phone_number, numero_escolhido):
     """Cancela o evento escolhido pelo número"""
     
-    sessao = user_cancel_sessions.get(phone_number)
+    # [NOVO] Busca do SessionManager
+    sessao = session_manager.get(phone_number, 'cancelamento')
     
     if not sessao:
         return '⚠️ Lista expirada. Envie *cancelar* para ver os eventos novamente.'
-    
-    if datetime.now() - sessao['timestamp'] > timedelta(minutes=5):
-        user_cancel_sessions.pop(phone_number, None)
-        return '⏰ Tempo expirado. Envie *cancelar* para ver os eventos novamente.'
     
     eventos = sessao['eventos']
     indice = numero_escolhido - 1
@@ -520,16 +642,24 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
         
         titulo_removido = evento.get('summary', 'Evento')
         data_removida = formatar_data_br(evento['start'])
-        eventos.pop(indice)
+        
+        # [NOVO] Limpa sessão
+        session_manager.delete(phone_number, 'cancelamento')
+        
+        logger.info("Evento cancelado", extra={
+            "user": phone_number,
+            "event_id": evento['id'],
+            "titulo": titulo_removido
+        })
         
         return f'✅ *Cancelado com sucesso!*\n\n🗑️ {titulo_removido}\n📅 {data_removida}'
         
     except Exception as e:
-        print(f"Erro ao cancelar: {e}")
+        logger.error("Erro ao cancelar", extra={"user": phone_number, "error": str(e)})
         return '❌ Erro ao cancelar. O evento pode já ter sido removido.'
 
 # ==========================================
-# RESUMO DA SEMANA (EXISTENTE)
+# RESUMO DA SEMANA
 # ==========================================
 
 def resumo_semana():
@@ -615,7 +745,7 @@ def resumo_semana():
         return mensagem
         
     except Exception as e:
-        print(f"Erro no resumo: {e}")
+        logger.error("Erro no resumo semana", extra={"error": str(e)})
         return '❌ Erro ao buscar agenda. Tente novamente.'
 
 # ==========================================
@@ -719,7 +849,7 @@ def parse(msg):
 
 def enviar_whatsapp(numero, mensagem):
     if not twilio_client:
-        print(f"❌ Twilio não configurado")
+        logger.error("Twilio não configurado")
         return False
     try:
         numero_limpo = numero.replace('whatsapp:', '')
@@ -730,21 +860,19 @@ def enviar_whatsapp(numero, mensagem):
             from_=f'whatsapp:{TWILIO_NUMBER}',
             to=f'whatsapp:{numero_limpo}'
         )
-        print(f"✅ WhatsApp: {msg.sid}")
+        logger.info("WhatsApp enviado", extra={"to": numero_limpo, "sid": msg.sid})
         return True
     except Exception as e:
-        print(f"❌ Erro Twilio: {e}")
+        logger.error("Erro Twilio", extra={"error": str(e), "to": numero})
         return False
 
 def verificar_lembretes():
-    print("🔄 Thread lembretes iniciada")
+    logger.info("Thread lembretes iniciada")
     while True:
         try:
             agora = agora_sp()
             time_min = agora.isoformat()
             time_max = (agora + timedelta(minutes=2)).isoformat()
-            
-            print(f"🔍 {agora.strftime('%d/%m %H:%M:%S')}")
             
             events = service.events().list(
                 calendarId=CAL_ID_LEMBRETES,
@@ -754,8 +882,6 @@ def verificar_lembretes():
                 orderBy='startTime',
                 q='[LEMBRETE]'
             ).execute()
-            
-            print(f"   {len(events.get('items', []))} lembretes")
             
             for event in events.get('items', []):
                 event_id = event.get('id')
@@ -768,22 +894,23 @@ def verificar_lembretes():
                 
                 mensagem = f"⏰ *Lembrete!*\n\n*{titulo}*\n🕐 {agora.strftime('%H:%M')}"
                 
-                print(f"   📤 {titulo}")
+                logger.info("Enviando lembrete", extra={"titulo": titulo, "to": numero})
                 if enviar_whatsapp(numero, mensagem):
                     lembretes_enviados.add(event_id)
                     
         except Exception as e:
-            print(f"❌ Erro: {e}")
+            logger.error("Erro na thread de lembretes", extra={"error": str(e)})
         
         time.sleep(60)
 
 threading.Thread(target=verificar_lembretes, daemon=True).start()
 
 # ==========================================
-# WEBHOOK PRINCIPAL
+# WEBHOOK PRINCIPAL (COM RATE LIMITING)
 # ==========================================
 
 @app.route("/webhook", methods=['POST'])
+@limiter.limit("30 per minute")  # [NOVO] Proteção contra flood
 def webhook():
     msg = request.values.get('Body', '').strip()
     numero = request.values.get('From', '')
@@ -791,12 +918,19 @@ def webhook():
     
     msg_lower = msg.lower()
     
+    # [NOVO] Logging estruturado de cada interação
+    logger.info("Webhook recebido", extra={
+        "user": numero,
+        "msg": msg[:50],
+        "ip": request.remote_addr
+    })
+    
     # ==========================================
     # VERIFICAÇÃO DE SESSÕES ATIVAS PRIMEIRO
     # ==========================================
     
     # Verifica se usuário está em processo de edição
-    sessao_edicao = user_edit_sessions.get(numero)
+    sessao_edicao = session_manager.get(numero, 'edicao')
     if sessao_edicao:
         # Se está aguardando escolha do campo (1, 2 ou 3)
         if sessao_edicao['etapa'] == 'escolher_campo':
@@ -815,7 +949,7 @@ def webhook():
             return str(resp)
     
     # ==========================================
-    # COMANDOS DE AGENDA (Item 1 - existente)
+    # COMANDOS DE AGENDA
     # ==========================================
     
     params_agenda = interpretar_comando_agenda(msg_lower)
@@ -825,16 +959,14 @@ def webhook():
         return str(resp)
     
     # ==========================================
-    # COMANDOS DE EDIÇÃO (Item 2 - NOVO)
+    # COMANDOS DE EDIÇÃO
     # ==========================================
     
-    # Comando inicial: editar
     if msg_lower == 'editar':
         resposta = listar_eventos_para_editar(numero)
         resp.message(resposta)
         return str(resp)
     
-    # Escolha do evento: editar 2
     match_editar_numero = re.match(r'^editar\s+(\d+)$', msg_lower)
     if match_editar_numero:
         numero_escolhido = int(match_editar_numero.group(1))
@@ -846,13 +978,11 @@ def webhook():
     # COMANDOS EXISTENTES
     # ==========================================
     
-    # Resumo da semana
     if msg_lower in ['agenda semana', 'agenda da semana', 'minha semana', 'próximos 7 dias']:
         resposta = resumo_semana()
         resp.message(resposta)
         return str(resp)
     
-    # Cancelar
     match_cancelar_numero = re.match(r'^cancelar\s+(\d+)$', msg_lower)
     
     if msg_lower == 'cancelar':
@@ -866,7 +996,6 @@ def webhook():
         resp.message(resposta)
         return str(resp)
     
-    # Ajuda
     if msg_lower in ['ajuda', 'help']:
         resp.message("""🤖 *Bot de Agenda*
 
@@ -904,7 +1033,12 @@ def webhook():
     
     titulo, inicio, eh_lembrete, cor = p
     
-    print(f"📝 {titulo} | {inicio.strftime('%d/%m %H:%M')} | Lembrete:{eh_lembrete}")
+    logger.info("Criando evento", extra={
+        "user": numero,
+        "titulo": titulo,
+        "inicio": inicio.isoformat(),
+        "eh_lembrete": eh_lembrete
+    })
     
     if eh_lembrete:
         evento = {
@@ -918,6 +1052,7 @@ def webhook():
         
         try:
             ev = service.events().insert(calendarId=CAL_ID_LEMBRETES, body=evento).execute()
+            logger.info("Lembrete criado", extra={"event_id": ev['id']})
             resp.message(f"""⏰ *Lembrete agendado!*
 
 *{titulo}*
@@ -925,6 +1060,7 @@ def webhook():
 
 💬 Te aviso na hora!""")
         except Exception as e:
+            logger.error("Erro ao criar lembrete", extra={"error": str(e)})
             resp.message(f"❌ Erro: {str(e)[:100]}")
     else:
         evento = {
@@ -937,9 +1073,11 @@ def webhook():
         
         try:
             ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
+            logger.info("Evento criado", extra={"event_id": ev['id']})
             emoji_cor = emoji_por_cor(cor)
             resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
         except Exception as e:
+            logger.error("Erro ao criar evento", extra={"error": str(e)})
             resp.message(f"❌ Erro: {str(e)[:100]}")
     
     return str(resp)
@@ -947,11 +1085,40 @@ def webhook():
 @app.route("/")
 def health():
     agora = agora_sp()
+    redis_status = "connected" if (redis_client and redis_client.ping()) else "disconnected"
+    
     return jsonify({
         "status": "ok",
         "hora": agora.strftime('%d/%m %H:%M:%S'),
-        "twilio": twilio_client is not None
+        "twilio": twilio_client is not None,
+        "redis": redis_status,
+        "version": "2.0.0-redis"
     })
+
+# [NOVO] Endpoint para testar Redis
+@app.route("/test-redis")
+def test_redis():
+    try:
+        if not redis_client:
+            return jsonify({"status": "error", "message": "Redis não configurado"}), 500
+        
+        redis_client.set('test', 'ok', ex=10)
+        value = redis_client.get('test')
+        
+        # Testa sessão
+        session_manager.set('+5511999999999', 'test', {"foo": "bar"})
+        sessao = session_manager.get('+5511999999999', 'test')
+        session_manager.delete('+5511999999999', 'test')
+        
+        return jsonify({
+            "status": "ok",
+            "redis_connection": True,
+            "test_value": value,
+            "session_test": sessao
+        })
+    except Exception as e:
+        logger.error("Teste Redis falhou", extra={"error": str(e)})
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
