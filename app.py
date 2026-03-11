@@ -47,7 +47,7 @@ redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 try:
     redis_client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5)
     redis_client.ping()  # Testa conexão
-    logger.info("Redis conectado", extra={"url": redis_url.replace(redis_url.split('@')[0], 'redis://***')})
+    logger.info("Redis conectado", extra={"url": redis_url.split('@')[1] if '@' in redis_url else 'localhost'})
 except Exception as e:
     logger.error("Falha ao conectar Redis", extra={"error": str(e)})
     # Fallback para memória local (apenas para desenvolvimento)
@@ -150,10 +150,6 @@ creds = service_account.Credentials.from_service_account_info(
 service = build('calendar', 'v3', credentials=creds)
 
 lembretes_enviados = set()
-
-# [NOVO] Variáveis globais removidas - agora usam SessionManager
-# user_cancel_sessions = {}  # REMOVIDO
-# user_edit_sessions = {}    # REMOVIDO
 
 # ==========================================
 # FUNÇÕES AUXILIARES COMPARTILHADAS
@@ -921,7 +917,7 @@ def webhook():
     # [NOVO] Logging estruturado de cada interação
     logger.info("Webhook recebido", extra={
         "user": numero,
-        "msg": msg[:50],
+        "message_text": msg[:50],  # ✅ CORRIGIDO: "msg" -> "message_text"
         "ip": request.remote_addr
     })
     
