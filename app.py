@@ -29,6 +29,151 @@ service = build('calendar', 'v3', credentials=creds)
 
 lembretes_enviados = set()
 
+# ==========================================
+# SISTEMA DE CANCELAMENTO (NOVO)
+# ==========================================
+
+# Armazena lista de eventos por usuário (válido 5 minutos)
+user_cancel_sessions = {}
+
+def formatar_data_br(start_dict):
+    """Converte data do Google Calendar para formato amigável em PT-BR"""
+    
+    # Evento de dia inteiro (sem hora específica)
+    if 'date' in start_dict:
+        data = datetime.strptime(start_dict['date'], '%Y-%m-%d')
+        dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+        return f"{dias_semana[data.weekday()]} {data.day:02d}/{data.month:02d} (dia todo)"
+    
+    # Evento com horário - extrai data/hora do ISO format
+    data_iso = start_dict['dateTime']  # Ex: 2024-01-15T15:00:00-03:00
+    
+    # Parse considerando timezone
+    if '+' in data_iso or data_iso.count('-') > 2:
+        # Remove timezone offset para parse
+        if '+' in data_iso:
+            data_limpa = data_iso[:data_iso.rfind('+')]
+        else:
+            # Último - é o timezone
+            partes = data_iso.rsplit('-', 1)
+            data_limpa = partes[0]
+    else:
+        data_limpa = data_iso.replace('Z', '')
+    
+    try:
+        data = datetime.fromisoformat(data_limpa)
+    except:
+        data = datetime.strptime(data_limpa[:19], '%Y-%m-%dT%H:%M:%S')
+    
+    data = data.replace(tzinfo=FUSO)
+    agora = datetime.now(FUSO)
+    amanha = agora + timedelta(days=1)
+    
+    dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+    
+    # Verifica se é hoje/amanhã
+    if data.date() == agora.date():
+        prefixo = 'Hoje'
+    elif data.date() == amanha.date():
+        prefixo = 'Amanhã'
+    else:
+        prefixo = f"{dias_semana[data.weekday()]} {data.day:02d}/{data.month:02d}"
+    
+    hora = data.strftime('%H:%M')
+    return f"{prefixo} às {hora}"
+
+
+def listar_eventos_cancelar(phone_number):
+    """Busca eventos dos próximos 7 dias e retorna mensagem formatada"""
+    
+    try:
+        agora = datetime.now(FUSO)
+        time_min = agora.isoformat()
+        daqui_7_dias = (agora + timedelta(days=7)).isoformat()
+        
+        # Busca eventos do calendário principal
+        events_result = service.events().list(
+            calendarId=CAL_ID_EVENTOS,
+            timeMin=time_min,
+            timeMax=daqui_7_dias,
+            singleEvents=True,
+            orderBy='startTime',
+            maxResults=20
+        ).execute()
+        
+        eventos = events_result.get('items', [])
+        
+        if not eventos:
+            return '✅ Não há eventos nos próximos 7 dias para cancelar.'
+        
+        # Salva na sessão do usuário (expira em 5 min)
+        user_cancel_sessions[phone_number] = {
+            'eventos': eventos,
+            'timestamp': datetime.now()
+        }
+        
+        # Monta mensagem
+        mensagem = '🗑️ *Eventos dos próximos 7 dias:*\n\n'
+        
+        for i, evento in enumerate(eventos, 1):
+            titulo = evento.get('summary', 'Sem título')
+            data_formatada = formatar_data_br(evento['start'])
+            mensagem += f"{i}. *{titulo}*\n   📅 {data_formatada}\n\n"
+        
+        mensagem += 'Para cancelar, responda:\n*cancelar número*\n_(ex: cancelar 2)_'
+        
+        return mensagem
+        
+    except Exception as e:
+        print(f"Erro ao listar: {e}")
+        return '❌ Erro ao buscar eventos. Tente novamente.'
+
+
+def confirmar_cancelamento(phone_number, numero_escolhido):
+    """Cancela o evento escolhido pelo número"""
+    
+    # Verifica se tem sessão ativa
+    sessao = user_cancel_sessions.get(phone_number)
+    
+    if not sessao:
+        return '⚠️ Lista expirada. Envie *cancelar* para ver os eventos novamente.'
+    
+    # Verifica se não expirou (5 minutos)
+    if datetime.now() - sessao['timestamp'] > timedelta(minutes=5):
+        user_cancel_sessions.pop(phone_number, None)
+        return '⏰ Tempo expirado. Envie *cancelar* para ver os eventos novamente.'
+    
+    eventos = sessao['eventos']
+    indice = numero_escolhido - 1
+    
+    # Valida número
+    if indice < 0 or indice >= len(eventos):
+        return f'❌ Número inválido. Escolha entre 1 e {len(eventos)}.'
+    
+    evento = eventos[indice]
+    
+    try:
+        # DELETA do Google Calendar
+        service.events().delete(
+            calendarId=CAL_ID_EVENTOS,
+            eventId=evento['id']
+        ).execute()
+        
+        # Remove da lista da sessão
+        titulo_removido = evento.get('summary', 'Evento')
+        data_removida = formatar_data_br(evento['start'])
+        eventos.pop(indice)
+        
+        return f'✅ *Cancelado com sucesso!*\n\n🗑️ {titulo_removido}\n📅 {data_removida}'
+        
+    except Exception as e:
+        print(f"Erro ao cancelar: {e}")
+        return '❌ Erro ao cancelar. O evento pode já ter sido removido.'
+
+# ==========================================
+# FIM DO SISTEMA DE CANCELAMENTO
+# ==========================================
+
 def agora_sp():
     return datetime.now(FUSO)
 
@@ -192,7 +337,33 @@ def webhook():
     numero = request.values.get('From', '')
     resp = MessagingResponse()
     
-    if msg.lower() in ['ajuda', 'help']:
+    msg_lower = msg.lower()
+    
+    # ==========================================
+    # COMANDOS DE CANCELAMENTO (NOVO - PRIORITÁRIO)
+    # ==========================================
+    
+    # Padrão: "cancelar 2", "cancelar 1", etc.
+    match_cancelar_numero = re.match(r'^cancelar\s+(\d+)$', msg_lower)
+    
+    if msg_lower == 'cancelar':
+        # Lista eventos para cancelar
+        resposta = listar_eventos_cancelar(numero)
+        resp.message(resposta)
+        return str(resp)
+    
+    elif match_cancelar_numero:
+        # Confirma cancelamento do número escolhido
+        numero_escolhido = int(match_cancelar_numero.group(1))
+        resposta = confirmar_cancelamento(numero, numero_escolhido)
+        resp.message(resposta)
+        return str(resp)
+    
+    # ==========================================
+    # COMANDOS EXISTENTES (SEU CÓDIGO ORIGINAL)
+    # ==========================================
+    
+    if msg_lower in ['ajuda', 'help']:
         resp.message("""🤖 *Bot de Agenda*
 
 *Eventos:*
@@ -202,6 +373,10 @@ def webhook():
 *Lembretes:*
 • lembrete daqui a 5 minutos
 • lembrete pagar conta amanhã 15h
+
+*Cancelar:*
+• cancelar (lista eventos)
+• cancelar 2 (cancela o #2)
 
 *Cores:* vermelho, laranja, amarelo, verde, azul, roxo""")
         return str(resp)
