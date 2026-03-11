@@ -30,10 +30,9 @@ service = build('calendar', 'v3', credentials=creds)
 lembretes_enviados = set()
 
 # ==========================================
-# SISTEMA DE CANCELAMENTO (NOVO)
+# SISTEMA DE CANCELAMENTO (EXISTENTE)
 # ==========================================
 
-# Armazena lista de eventos por usuário (válido 5 minutos)
 user_cancel_sessions = {}
 
 def formatar_data_br(start_dict):
@@ -46,19 +45,13 @@ def formatar_data_br(start_dict):
         return f"{dias_semana[data.weekday()]} {data.day:02d}/{data.month:02d} (dia todo)"
     
     # Evento com horário - extrai data/hora do ISO format
-    data_iso = start_dict['dateTime']  # Ex: 2024-01-15T15:00:00-03:00
+    data_iso = start_dict['dateTime']
     
-    # Parse considerando timezone
-    if '+' in data_iso or data_iso.count('-') > 2:
-        # Remove timezone offset para parse
-        if '+' in data_iso:
-            data_limpa = data_iso[:data_iso.rfind('+')]
-        else:
-            # Último - é o timezone
-            partes = data_iso.rsplit('-', 1)
-            data_limpa = partes[0]
+    if '+' in data_iso:
+        data_limpa = data_iso[:data_iso.rfind('+')]
     else:
-        data_limpa = data_iso.replace('Z', '')
+        partes = data_iso.rsplit('-', 1)
+        data_limpa = partes[0]
     
     try:
         data = datetime.fromisoformat(data_limpa)
@@ -71,7 +64,6 @@ def formatar_data_br(start_dict):
     
     dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
     
-    # Verifica se é hoje/amanhã
     if data.date() == agora.date():
         prefixo = 'Hoje'
     elif data.date() == amanha.date():
@@ -84,14 +76,13 @@ def formatar_data_br(start_dict):
 
 
 def listar_eventos_cancelar(phone_number):
-    """Busca eventos dos próximos 7 dias e retorna mensagem formatada"""
+    """Busca eventos dos próximos 7 dias para cancelamento"""
     
     try:
         agora = datetime.now(FUSO)
         time_min = agora.isoformat()
         daqui_7_dias = (agora + timedelta(days=7)).isoformat()
         
-        # Busca eventos do calendário principal
         events_result = service.events().list(
             calendarId=CAL_ID_EVENTOS,
             timeMin=time_min,
@@ -106,13 +97,11 @@ def listar_eventos_cancelar(phone_number):
         if not eventos:
             return '✅ Não há eventos nos próximos 7 dias para cancelar.'
         
-        # Salva na sessão do usuário (expira em 5 min)
         user_cancel_sessions[phone_number] = {
             'eventos': eventos,
             'timestamp': datetime.now()
         }
         
-        # Monta mensagem
         mensagem = '🗑️ *Eventos dos próximos 7 dias:*\n\n'
         
         for i, evento in enumerate(eventos, 1):
@@ -132,13 +121,11 @@ def listar_eventos_cancelar(phone_number):
 def confirmar_cancelamento(phone_number, numero_escolhido):
     """Cancela o evento escolhido pelo número"""
     
-    # Verifica se tem sessão ativa
     sessao = user_cancel_sessions.get(phone_number)
     
     if not sessao:
         return '⚠️ Lista expirada. Envie *cancelar* para ver os eventos novamente.'
     
-    # Verifica se não expirou (5 minutos)
     if datetime.now() - sessao['timestamp'] > timedelta(minutes=5):
         user_cancel_sessions.pop(phone_number, None)
         return '⏰ Tempo expirado. Envie *cancelar* para ver os eventos novamente.'
@@ -146,20 +133,17 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
     eventos = sessao['eventos']
     indice = numero_escolhido - 1
     
-    # Valida número
     if indice < 0 or indice >= len(eventos):
         return f'❌ Número inválido. Escolha entre 1 e {len(eventos)}.'
     
     evento = eventos[indice]
     
     try:
-        # DELETA do Google Calendar
         service.events().delete(
             calendarId=CAL_ID_EVENTOS,
             eventId=evento['id']
         ).execute()
         
-        # Remove da lista da sessão
         titulo_removido = evento.get('summary', 'Evento')
         data_removida = formatar_data_br(evento['start'])
         eventos.pop(indice)
@@ -171,7 +155,106 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
         return '❌ Erro ao cancelar. O evento pode já ter sido removido.'
 
 # ==========================================
-# FIM DO SISTEMA DE CANCELAMENTO
+# RESUMO DA SEMANA (NOVO)
+# ==========================================
+
+def resumo_semana():
+    """Retorna resumo dos próximos 7 dias em formato de agenda visual"""
+    
+    try:
+        agora = datetime.now(FUSO)
+        time_min = agora.isoformat()
+        daqui_7_dias = (agora + timedelta(days=7)).isoformat()
+        
+        events_result = service.events().list(
+            calendarId=CAL_ID_EVENTOS,
+            timeMin=time_min,
+            timeMax=daqui_7_dias,
+            singleEvents=True,
+            orderBy='startTime',
+            maxResults=50
+        ).execute()
+        
+        eventos = events_result.get('items', [])
+        
+        if not eventos:
+            return '📅 *Sua agenda dos próximos 7 dias:*\n\n✅ Nenhum evento agendado!'
+        
+        # Agrupa por dia
+        eventos_por_dia = {}
+        
+        for evento in eventos:
+            start = evento['start']
+            
+            # Pega a data (sem hora) para agrupar
+            if 'date' in start:
+                data_key = start['date']
+            else:
+                data_iso = start['dateTime'][:10]  # Pega só YYYY-MM-DD
+                data_key = data_iso
+            
+            if data_key not in eventos_por_dia:
+                eventos_por_dia[data_key] = []
+            
+            eventos_por_dia[data_key].append(evento)
+        
+        # Ordena as datas
+        datas_ordenadas = sorted(eventos_por_dia.keys())
+        
+        # Monta mensagem agrupada por dia
+        mensagem = '📅 *Sua agenda - Próximos 7 dias*\n'
+        mensagem += f'_{agora.strftime("%d/%m/%Y")} a {(agora + timedelta(days=7)).strftime("%d/%m/%Y")}_\n\n'
+        
+        for data_str in datas_ordenadas:
+            eventos_do_dia = eventos_por_dia[data_str]
+            
+            # Formata cabeçalho do dia
+            data_obj = datetime.strptime(data_str, '%Y-%m-%d')
+            dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+            
+            hoje = agora.date()
+            data_evento = data_obj.date()
+            
+            if data_evento == hoje:
+                dia_titulo = "📍 *HOJE*"
+            elif data_evento == hoje + timedelta(days=1):
+                dia_titulo = "🔜 *AMANHÃ*"
+            else:
+                nome_dia = dias_semana[data_obj.weekday()]
+                dia_titulo = f"📆 *{nome_dia}* ({data_obj.day:02d}/{data_obj.month:02d})"
+            
+            mensagem += f"{dia_titulo}\n"
+            
+            # Lista eventos do dia
+            for evento in eventos_do_dia:
+                titulo = evento.get('summary', 'Sem título')
+                
+                # Pega cor do evento (se tiver)
+                cor_id = evento.get('colorId', '9')
+                emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor_id, '⚪')
+                
+                # Formata hora
+                if 'date' in evento['start']:
+                    hora_str = "dia todo"
+                else:
+                    hora = datetime.fromisoformat(evento['start']['dateTime'][:19])
+                    hora_str = hora.strftime('%H:%M')
+                
+                mensagem += f"  {emoji_cor} {hora_str} — {titulo}\n"
+            
+            mensagem += "\n"
+        
+        total = len(eventos)
+        mensagem += f"📊 *Total: {total} evento{'s' if total > 1 else ''}*"
+        
+        return mensagem
+        
+    except Exception as e:
+        print(f"Erro no resumo: {e}")
+        return '❌ Erro ao buscar agenda. Tente novamente.'
+
+# ==========================================
+# FIM DAS FUNÇÕES AUXILIARES
 # ==========================================
 
 def agora_sp():
@@ -340,27 +423,31 @@ def webhook():
     msg_lower = msg.lower()
     
     # ==========================================
-    # COMANDOS DE CANCELAMENTO (NOVO - PRIORITÁRIO)
+    # COMANDOS PRIORITÁRIOS
     # ==========================================
     
-    # Padrão: "cancelar 2", "cancelar 1", etc.
+    # NOVO: Resumo da semana
+    if msg_lower in ['agenda semana', 'agenda da semana', 'minha semana', 'próximos 7 dias']:
+        resposta = resumo_semana()
+        resp.message(resposta)
+        return str(resp)
+    
+    # Cancelar existente
     match_cancelar_numero = re.match(r'^cancelar\s+(\d+)$', msg_lower)
     
     if msg_lower == 'cancelar':
-        # Lista eventos para cancelar
         resposta = listar_eventos_cancelar(numero)
         resp.message(resposta)
         return str(resp)
     
     elif match_cancelar_numero:
-        # Confirma cancelamento do número escolhido
         numero_escolhido = int(match_cancelar_numero.group(1))
         resposta = confirmar_cancelamento(numero, numero_escolhido)
         resp.message(resposta)
         return str(resp)
     
     # ==========================================
-    # COMANDOS EXISTENTES (SEU CÓDIGO ORIGINAL)
+    # COMANDOS EXISTENTES
     # ==========================================
     
     if msg_lower in ['ajuda', 'help']:
@@ -373,6 +460,9 @@ def webhook():
 *Lembretes:*
 • lembrete daqui a 5 minutos
 • lembrete pagar conta amanhã 15h
+
+*Agenda:*
+• agenda semana (próximos 7 dias)
 
 *Cancelar:*
 • cancelar (lista eventos)
