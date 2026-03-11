@@ -218,8 +218,24 @@ def extrair_hora_de_string(texto):
     return None, None
 
 # ==========================================
-# 1. RESUMO DO DIA ESPECÍFICO
+# FUNÇÕES COM RETRY (CORREÇÃO BROKEN PIPE)
 # ==========================================
+
+def executar_com_retry(func, max_tentativas=2, delay=1):
+    """Executa função com retry em caso de erro de conexão"""
+    for tentativa in range(max_tentativas):
+        try:
+            return func()
+        except Exception as e:
+            erro_str = str(e).lower()
+            if 'broken pipe' in erro_str or 'connection' in erro_str or 'timeout' in erro_str:
+                if tentativa < max_tentativas - 1:
+                    logger.warning(f"Erro de conexão, tentando novamente... ({tentativa + 1}/{max_tentativas})")
+                    time.sleep(delay)
+                    continue
+            raise e
+    return None
+
 
 def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
     """Retorna eventos de um dia específico com formatação visual"""
@@ -235,14 +251,17 @@ def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
         inicio_dia = data_base.replace(hour=0, minute=0, second=0, microsecond=0)
         fim_dia = data_base.replace(hour=23, minute=59, second=59, microsecond=999999)
         
-        events_result = service.events().list(
-            calendarId=CAL_ID_EVENTOS,
-            timeMin=inicio_dia.isoformat(),
-            timeMax=fim_dia.isoformat(),
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
+        # Usa retry para evitar Broken pipe
+        def buscar_eventos():
+            return service.events().list(
+                calendarId=CAL_ID_EVENTOS,
+                timeMin=inicio_dia.isoformat(),
+                timeMax=fim_dia.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
         
+        events_result = executar_com_retry(buscar_eventos)
         eventos = events_result.get('items', [])
         
         dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
@@ -283,7 +302,7 @@ def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
         
     except Exception as e:
         logger.error("Erro no resumo do dia", extra={"error": str(e), "dias_futuro": dias_futuro})
-        return '❌ Erro ao buscar agenda. Tente novamente.'
+        return '❌ Erro ao buscar agenda. Tente novamente em alguns segundos.'
 
 
 def interpretar_comando_agenda(msg_lower):
@@ -351,15 +370,17 @@ def listar_eventos_para_editar(phone_number):
         time_min = agora.isoformat()
         daqui_7_dias = (agora + timedelta(days=7)).isoformat()
         
-        events_result = service.events().list(
-            calendarId=CAL_ID_EVENTOS,
-            timeMin=time_min,
-            timeMax=daqui_7_dias,
-            singleEvents=True,
-            orderBy='startTime',
-            maxResults=20
-        ).execute()
+        def buscar_eventos():
+            return service.events().list(
+                calendarId=CAL_ID_EVENTOS,
+                timeMin=time_min,
+                timeMax=daqui_7_dias,
+                singleEvents=True,
+                orderBy='startTime',
+                maxResults=20
+            ).execute()
         
+        events_result = executar_com_retry(buscar_eventos)
         eventos = events_result.get('items', [])
         
         if not eventos:
@@ -478,10 +499,13 @@ def aplicar_edicao(phone_number, valor_informado):
     
     try:
         # Busca evento atual no Google
-        evento_atual = service.events().get(
-            calendarId=CAL_ID_EVENTOS,
-            eventId=event_id
-        ).execute()
+        def buscar_evento():
+            return service.events().get(
+                calendarId=CAL_ID_EVENTOS,
+                eventId=event_id
+            ).execute()
+        
+        evento_atual = executar_com_retry(buscar_evento)
         
         if campo == 'horario':
             nova_hora, novo_minuto = extrair_hora_de_string(valor_informado)
@@ -545,11 +569,14 @@ def aplicar_edicao(phone_number, valor_informado):
             resultado = f"🎨 Cor atualizada: {cor_antiga} → {cor_nome}"
         
         # Aplica update no Google Calendar
-        service.events().update(
-            calendarId=CAL_ID_EVENTOS,
-            eventId=event_id,
-            body=evento_atual
-        ).execute()
+        def atualizar_evento():
+            return service.events().update(
+                calendarId=CAL_ID_EVENTOS,
+                eventId=event_id,
+                body=evento_atual
+            ).execute()
+        
+        executar_com_retry(atualizar_evento)
         
         # [NOVO] Limpa sessão do Redis
         session_manager.delete(phone_number, 'edicao')
@@ -578,15 +605,17 @@ def listar_eventos_cancelar(phone_number):
         time_min = agora.isoformat()
         daqui_7_dias = (agora + timedelta(days=7)).isoformat()
         
-        events_result = service.events().list(
-            calendarId=CAL_ID_EVENTOS,
-            timeMin=time_min,
-            timeMax=daqui_7_dias,
-            singleEvents=True,
-            orderBy='startTime',
-            maxResults=20
-        ).execute()
+        def buscar_eventos():
+            return service.events().list(
+                calendarId=CAL_ID_EVENTOS,
+                timeMin=time_min,
+                timeMax=daqui_7_dias,
+                singleEvents=True,
+                orderBy='startTime',
+                maxResults=20
+            ).execute()
         
+        events_result = executar_com_retry(buscar_eventos)
         eventos = events_result.get('items', [])
         
         if not eventos:
@@ -631,10 +660,13 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
     evento = eventos[indice]
     
     try:
-        service.events().delete(
-            calendarId=CAL_ID_EVENTOS,
-            eventId=evento['id']
-        ).execute()
+        def deletar_evento():
+            return service.events().delete(
+                calendarId=CAL_ID_EVENTOS,
+                eventId=evento['id']
+            ).execute()
+        
+        executar_com_retry(deletar_evento)
         
         titulo_removido = evento.get('summary', 'Evento')
         data_removida = formatar_data_br(evento['start'])
@@ -666,15 +698,17 @@ def resumo_semana():
         time_min = agora.isoformat()
         daqui_7_dias = (agora + timedelta(days=7)).isoformat()
         
-        events_result = service.events().list(
-            calendarId=CAL_ID_EVENTOS,
-            timeMin=time_min,
-            timeMax=daqui_7_dias,
-            singleEvents=True,
-            orderBy='startTime',
-            maxResults=50
-        ).execute()
+        def buscar_eventos():
+            return service.events().list(
+                calendarId=CAL_ID_EVENTOS,
+                timeMin=time_min,
+                timeMax=daqui_7_dias,
+                singleEvents=True,
+                orderBy='startTime',
+                maxResults=50
+            ).execute()
         
+        events_result = executar_com_retry(buscar_eventos)
         eventos = events_result.get('items', [])
         
         if not eventos:
@@ -756,16 +790,18 @@ def buscar_eventos_por_termo(termo, periodo_dias=365):
         time_min = agora.isoformat()
         time_max = (agora + timedelta(days=periodo_dias)).isoformat()
         
-        # Busca no Google Calendar
-        events_result = service.events().list(
-            calendarId=CAL_ID_EVENTOS,
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy='startTime',
-            q=termo  # Busca no título e descrição
-        ).execute()
+        # Usa retry para evitar Broken pipe
+        def buscar_no_calendar():
+            return service.events().list(
+                calendarId=CAL_ID_EVENTOS,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy='startTime',
+                q=termo
+            ).execute()
         
+        events_result = executar_com_retry(buscar_no_calendar)
         eventos = events_result.get('items', [])
         
         # Filtra eventos que contêm o termo (case insensitive)
@@ -978,14 +1014,17 @@ def verificar_lembretes():
             time_min = agora.isoformat()
             time_max = (agora + timedelta(minutes=2)).isoformat()
             
-            events = service.events().list(
-                calendarId=CAL_ID_LEMBRETES,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy='startTime',
-                q='[LEMBRETE]'
-            ).execute()
+            def buscar_lembretes():
+                return service.events().list(
+                    calendarId=CAL_ID_LEMBRETES,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy='startTime',
+                    q='[LEMBRETE]'
+                ).execute()
+            
+            events = executar_com_retry(buscar_lembretes)
             
             for event in events.get('items', []):
                 event_id = event.get('id')
@@ -1173,7 +1212,10 @@ def webhook():
         }
         
         try:
-            ev = service.events().insert(calendarId=CAL_ID_LEMBRETES, body=evento).execute()
+            def criar_lembrete():
+                return service.events().insert(calendarId=CAL_ID_LEMBRETES, body=evento).execute()
+            
+            ev = executar_com_retry(criar_lembrete)
             logger.info("Lembrete criado", extra={"event_id": ev['id']})
             resp.message(f"""⏰ *Lembrete agendado!*
 
@@ -1194,7 +1236,10 @@ def webhook():
         }
         
         try:
-            ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
+            def criar_evento():
+                return service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
+            
+            ev = executar_com_retry(criar_evento)
             logger.info("Evento criado", extra={"event_id": ev['id']})
             emoji_cor = emoji_por_cor(cor)
             resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
@@ -1214,7 +1259,7 @@ def health():
         "hora": agora.strftime('%d/%m %H:%M:%S'),
         "twilio": twilio_client is not None,
         "redis": redis_status,
-        "version": "2.1.0-busca"
+        "version": "2.1.1-retry"
     })
 
 # [NOVO] Endpoint para testar Redis
