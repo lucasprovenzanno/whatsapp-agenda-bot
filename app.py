@@ -781,14 +781,26 @@ def resumo_semana():
 # ==========================================
 # BUSCA INTELIGENTE (NOVO)
 # ==========================================
-
-def buscar_eventos_por_termo(termo, periodo_dias=365):
-    """Busca eventos por palavra-chave no Google Calendar"""
+def buscar_eventos_por_termo(termo, periodo_dias=365, incluir_passados=False):
+    """Busca eventos por palavra-chave no Google Calendar
+    
+    Args:
+        termo: palavra a buscar
+        periodo_dias: dias para frente (padrão 365)
+        incluir_passados: se True, busca desde 1º de janeiro do ano atual
+    """
     
     try:
         agora = datetime.now(FUSO)
-        time_min = agora.isoformat()
-        time_max = (agora + timedelta(days=periodo_dias)).isoformat()
+        
+        if incluir_passados:
+            # Busca desde 1º de janeiro do ano atual até o futuro
+            time_min = datetime(agora.year, 1, 1, tzinfo=FUSO).isoformat()
+            time_max = (agora + timedelta(days=periodo_dias)).isoformat()
+        else:
+            # Busca só futuro (comportamento atual)
+            time_min = agora.isoformat()
+            time_max = (agora + timedelta(days=periodo_dias)).isoformat()
         
         # Usa retry para evitar Broken pipe
         def buscar_no_calendar():
@@ -798,7 +810,8 @@ def buscar_eventos_por_termo(termo, periodo_dias=365):
                 timeMax=time_max,
                 singleEvents=True,
                 orderBy='startTime',
-                q=termo
+                q=termo,
+                maxResults=2500  # Máximo permitido pela API
             ).execute()
         
         events_result = executar_com_retry(buscar_no_calendar)
@@ -822,15 +835,17 @@ def buscar_eventos_por_termo(termo, periodo_dias=365):
         return []
 
 
-def formatar_resultado_busca(eventos, termo, modo='lista'):
+def formatar_resultado_busca(eventos, termo, modo='lista', incluir_passados=False):
     """Formata o resultado da busca para WhatsApp"""
     
     if not eventos:
         return f'🔍 Nenhum evento encontrado com "*{termo}*".'
     
+    # Determina o período da busca
     if modo == 'contar':
         total = len(eventos)
-        return f'📊 *Resultado da busca*\n\nTermo: "{termo}"\nTotal: *{total}* evento{"s" if total > 1 else ""} encontrado{"s" if total > 1 else ""}.'
+        periodo = "este ano" if incluir_passados else "próximos dias"
+        return f'📊 *Resultado da busca*\n\nTermo: "{termo}"\nPeríodo: {periodo}\nTotal: *{total}* evento{"s" if total > 1 else ""}.'
     
     if modo == 'proximo':
         # Retorna apenas o próximo evento
@@ -861,32 +876,40 @@ def formatar_resultado_busca(eventos, termo, modo='lista'):
     
     return mensagem
 
-
 def interpretar_comando_busca(msg_lower):
-    """Interpreta comandos de busca e retorna (termo, modo)"""
+    """Interpreta comandos de busca e retorna (termo, modo, incluir_passados)"""
     
     padroes = [
-        # "quando é academia?" ou "quando é o dentista?"
-        (r'^(?:quando\s+(?:é|eh|ea)\s+(?:o\s+|a\s+)?(.+?))\??$', 'proximo'),
+        # "quando é academia?" ou "quando é o dentista?" - só futuro
+        (r'^(?:quando\s+(?:é|eh|ea)\s+(?:o\s+|a\s+)?(.+?))\??$', 'proximo', False),
         
-        # "buscar academia" ou "procurar dentista"
-        (r'^(?:buscar|procurar|pesquisar|achar)\s+(.+)$', 'lista'),
+        # "buscar academia" - só futuro
+        (r'^(?:buscar|procurar|pesquisar|achar)\s+(.+)$', 'lista', False),
         
-        # "quantos eventos de academia" ou "contar academia"
-        (r'^(?:quantos\s+eventos?\s+(?:de\s+)?|contar\s+)(.+)$', 'contar'),
+        # "contar academia" - só futuro
+        (r'^(?:quantos\s+eventos?\s+(?:de\s+)?|contar\s+)(.+)$', 'contar', False),
         
-        # "quantas vezes academia este ano"
-        (r'^(?:quantas\s+vezes\s+)(.+?)(?:\s+este\s+ano)?$', 'contar'),
+        # "quantas vezes academia este ano" - INCLUI PASSADO
+        (r'^(?:quantas\s+vezes\s+)(.+?)(?:\s+este\s+ano)$', 'contar', True),
+        
+        # "quantos dias fui na academia" - INCLUI PASSADO
+        (r'^(?:quantos\s+dias\s+(?:fui|fomos)\s+(?:na|no|a|ao)?\s*)(.+)$', 'contar', True),
+        
+        # "total de academia este ano" - INCLUI PASSADO
+        (r'^(?:total\s+(?:de\s+)?)(.+?)(?:\s+este\s+ano)?$', 'contar', True),
+        
+        # "historico de academia" - INCLUI PASSADO
+        (r'^(?:historico|histórico)\s+(?:de\s+)?(.+)$', 'lista', True),
     ]
     
-    for padrao, modo in padroes:
+    for padrao, modo, incluir_passados in padroes:
         if m := re.match(padrao, msg_lower):
             termo = m.group(1).strip()
             # Remove artigos do início
-            termo = re.sub(r'^(o |a |os |as |um |uma )', '', termo)
-            return termo, modo
+            termo = re.sub(r'^(o |a |os |as |um |uma |na |no )', '', termo)
+            return termo, modo, incluir_passados
     
-    return None, None
+    return None, None, False
 
 # ==========================================
 # FUNÇÕES ORIGINAIS
@@ -1095,10 +1118,23 @@ def webhook():
     # BUSCA INTELIGENTE (NOVO)
     # ==========================================
     
-    termo_busca, modo_busca = interpretar_comando_busca(msg_lower)
+       # ==========================================
+    # BUSCA INTELIGENTE (NOVO)
+    # ==========================================
+    
+    termo_busca, modo_busca, incluir_passados = interpretar_comando_busca(msg_lower)
     if termo_busca:
-        logger.info("Buscando eventos", extra={"termo": termo_busca, "modo": modo_busca, "user": numero})
-        eventos_encontrados = buscar_eventos_por_termo(termo_busca, periodo_dias=365)
+        logger.info("Buscando eventos", extra={
+            "termo": termo_busca, 
+            "modo": modo_busca, 
+            "incluir_passados": incluir_passados,
+            "user": numero
+        })
+        eventos_encontrados = buscar_eventos_por_termo(
+            termo_busca, 
+            periodo_dias=365, 
+            incluir_passados=incluir_passados
+        )
         resposta = formatar_resultado_busca(eventos_encontrados, termo_busca, modo_busca)
         resp.message(resposta)
         return str(resp)
@@ -1289,3 +1325,4 @@ def test_redis():
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+
