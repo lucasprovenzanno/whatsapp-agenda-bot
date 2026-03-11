@@ -30,7 +30,7 @@ service = build('calendar', 'v3', credentials=creds)
 lembretes_enviados = set()
 
 # ==========================================
-# SISTEMA DE CANCELAMENTO (EXISTENTE)
+# FUNÇÕES AUXILIARES COMPARTILHADAS
 # ==========================================
 
 user_cancel_sessions = {}
@@ -38,13 +38,11 @@ user_cancel_sessions = {}
 def formatar_data_br(start_dict):
     """Converte data do Google Calendar para formato amigável em PT-BR"""
     
-    # Evento de dia inteiro (sem hora específica)
     if 'date' in start_dict:
         data = datetime.strptime(start_dict['date'], '%Y-%m-%d')
         dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
         return f"{dias_semana[data.weekday()]} {data.day:02d}/{data.month:02d} (dia todo)"
     
-    # Evento com horário - extrai data/hora do ISO format
     data_iso = start_dict['dateTime']
     
     if '+' in data_iso:
@@ -74,6 +72,149 @@ def formatar_data_br(start_dict):
     hora = data.strftime('%H:%M')
     return f"{prefixo} às {hora}"
 
+
+def emoji_por_cor(cor_id):
+    """Retorna emoji baseado na cor do evento"""
+    return {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor_id, '⚪')
+
+# ==========================================
+# 1. RESUMO DO DIA ESPECÍFICO (NOVO)
+# ==========================================
+
+def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
+    """Retorna eventos de um dia específico com formatação visual"""
+    
+    try:
+        agora = datetime.now(FUSO)
+        
+        if data_especifica:
+            # Data específica fornecida (para comandos como "agenda 15/03")
+            data_base = data_especifica
+        else:
+            # Dias a partir de hoje (0=hoje, 1=amanhã, etc)
+            data_base = agora + timedelta(days=dias_futuro)
+        
+        # Define início e fim do dia
+        inicio_dia = data_base.replace(hour=0, minute=0, second=0, microsecond=0)
+        fim_dia = data_base.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        # Busca eventos do dia
+        events_result = service.events().list(
+            calendarId=CAL_ID_EVENTOS,
+            timeMin=inicio_dia.isoformat(),
+            timeMax=fim_dia.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        eventos = events_result.get('items', [])
+        
+        # Define título do cabeçalho
+        dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+        nome_dia_semana = dias_semana[data_base.weekday()]
+        data_formatada = f"{data_base.day:02d}/{data_base.month:02d}"
+        
+        if dias_futuro == 0:
+            titulo_dia = "📍 *HOJE*"
+        elif dias_futuro == 1:
+            titulo_dia = "🔜 *AMANHÃ*"
+        elif nome_dia:
+            titulo_dia = f"📆 *{nome_dia.upper()}* ({data_formatada})"
+        else:
+            titulo_dia = f"📆 *{nome_dia_semana}* ({data_formatada})"
+        
+        # Monta mensagem
+        if not eventos:
+            return f'{titulo_dia}\n\n✅ Nenhum evento agendado para este dia!'
+        
+        mensagem = f'{titulo_dia}\n\n'
+        
+        for evento in eventos:
+            titulo = evento.get('summary', 'Sem título')
+            cor_id = evento.get('colorId', '9')
+            emoji = emoji_por_cor(cor_id)
+            
+            # Formata hora
+            if 'date' in evento['start']:
+                hora_str = "dia todo"
+            else:
+                hora = datetime.fromisoformat(evento['start']['dateTime'][:19])
+                hora_str = hora.strftime('%H:%M')
+            
+            mensagem += f"{emoji} {hora_str} — *{titulo}*\n"
+        
+        total = len(eventos)
+        mensagem += f"\n📊 {total} evento{'s' if total > 1 else ''}"
+        
+        return mensagem
+        
+    except Exception as e:
+        print(f"Erro no resumo do dia: {e}")
+        return '❌ Erro ao buscar agenda. Tente novamente.'
+
+
+def interpretar_comando_agenda(msg_lower):
+    """Interpreta comandos de agenda e retorna parâmetros para resumo_dia_especifico"""
+    
+    # Padrões de reconhecimento
+    padroes = [
+        # agenda hoje / o que tenho hoje
+        (r'^(?:agenda|o que tenho)\s+hoje$', {'dias_futuro': 0}),
+        
+        # agenda amanhã / o que tenho amanhã
+        (r'^(?:agenda|o que tenho)\s+amanh[ãa]$', {'dias_futuro': 1}),
+        
+        # agenda segunda, terça, etc
+        (r'^(?:agenda|o que tenho)\s+(segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)$', 
+         lambda m: {'nome_dia': m.group(1), 'dias_futuro': calcular_dias_ate_dia(m.group(1))}),
+        
+        # agenda 15/03 ou agenda 15/03/2024
+        (r'^(?:agenda|o que tenho)\s+(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$',
+         lambda m: {'data_especifica': parse_data_manual(int(m.group(1)), int(m.group(2)), m.group(3))}),
+    ]
+    
+    for padrao, params in padroes:
+        if m := re.match(padrao, msg_lower):
+            if callable(params):
+                return params(m)
+            return params
+    
+    return None
+
+
+def calcular_dias_ate_dia(nome_dia):
+    """Calcula quantos dias faltam até o próximo dia da semana"""
+    dias = {
+        'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2, 
+        'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6
+    }
+    agora = datetime.now(FUSO)
+    dia_alvo = dias.get(nome_dia.lower(), 0)
+    dias_ate = (dia_alvo - agora.weekday()) % 7
+    if dias_ate == 0:
+        dias_ate = 7  # Próxima semana se for hoje
+    return dias_ate
+
+
+def parse_data_manual(dia, mes, ano_str=None):
+    """Converte dia/mes/ano para datetime"""
+    agora = datetime.now(FUSO)
+    ano = int(ano_str) if ano_str else agora.year
+    if ano < 100:
+        ano = 2000 + ano
+    
+    try:
+        data = datetime(ano, mes, dia, tzinfo=FUSO)
+        if data.date() < agora.date():
+            # Se data já passou este ano, assume próximo ano
+            data = datetime(ano + 1, mes, dia, tzinfo=FUSO)
+        return data
+    except:
+        return None
+
+# ==========================================
+# SISTEMA DE CANCELAMENTO (EXISTENTE)
+# ==========================================
 
 def listar_eventos_cancelar(phone_number):
     """Busca eventos dos próximos 7 dias para cancelamento"""
@@ -155,7 +296,7 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
         return '❌ Erro ao cancelar. O evento pode já ter sido removido.'
 
 # ==========================================
-# RESUMO DA SEMANA (NOVO)
+# RESUMO DA SEMANA (EXISTENTE)
 # ==========================================
 
 def resumo_semana():
@@ -186,11 +327,10 @@ def resumo_semana():
         for evento in eventos:
             start = evento['start']
             
-            # Pega a data (sem hora) para agrupar
             if 'date' in start:
                 data_key = start['date']
             else:
-                data_iso = start['dateTime'][:10]  # Pega só YYYY-MM-DD
+                data_iso = start['dateTime'][:10]
                 data_key = data_iso
             
             if data_key not in eventos_por_dia:
@@ -198,17 +338,14 @@ def resumo_semana():
             
             eventos_por_dia[data_key].append(evento)
         
-        # Ordena as datas
         datas_ordenadas = sorted(eventos_por_dia.keys())
         
-        # Monta mensagem agrupada por dia
         mensagem = '📅 *Sua agenda - Próximos 7 dias*\n'
         mensagem += f'_{agora.strftime("%d/%m/%Y")} a {(agora + timedelta(days=7)).strftime("%d/%m/%Y")}_\n\n'
         
         for data_str in datas_ordenadas:
             eventos_do_dia = eventos_por_dia[data_str]
             
-            # Formata cabeçalho do dia
             data_obj = datetime.strptime(data_str, '%Y-%m-%d')
             dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
             
@@ -225,22 +362,18 @@ def resumo_semana():
             
             mensagem += f"{dia_titulo}\n"
             
-            # Lista eventos do dia
             for evento in eventos_do_dia:
                 titulo = evento.get('summary', 'Sem título')
-                
-                # Pega cor do evento (se tiver)
                 cor_id = evento.get('colorId', '9')
-                emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor_id, '⚪')
+                emoji = emoji_por_cor(cor_id)
                 
-                # Formata hora
                 if 'date' in evento['start']:
                     hora_str = "dia todo"
                 else:
                     hora = datetime.fromisoformat(evento['start']['dateTime'][:19])
                     hora_str = hora.strftime('%H:%M')
                 
-                mensagem += f"  {emoji_cor} {hora_str} — {titulo}\n"
+                mensagem += f"  {emoji} {hora_str} — {titulo}\n"
             
             mensagem += "\n"
         
@@ -254,7 +387,7 @@ def resumo_semana():
         return '❌ Erro ao buscar agenda. Tente novamente.'
 
 # ==========================================
-# FIM DAS FUNÇÕES AUXILIARES
+# FUNÇÕES ORIGINAIS
 # ==========================================
 
 def agora_sp():
@@ -414,6 +547,10 @@ def verificar_lembretes():
 
 threading.Thread(target=verificar_lembretes, daemon=True).start()
 
+# ==========================================
+# WEBHOOK PRINCIPAL
+# ==========================================
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     msg = request.values.get('Body', '').strip()
@@ -423,16 +560,27 @@ def webhook():
     msg_lower = msg.lower()
     
     # ==========================================
-    # COMANDOS PRIORITÁRIOS
+    # NOVO: RESUMO DO DIA ESPECÍFICO (Item 1)
     # ==========================================
     
-    # NOVO: Resumo da semana
+    # Verifica comandos de agenda específica primeiro
+    params_agenda = interpretar_comando_agenda(msg_lower)
+    if params_agenda:
+        resposta = resumo_dia_especifico(**params_agenda)
+        resp.message(resposta)
+        return str(resp)
+    
+    # ==========================================
+    # COMANDOS EXISTENTES
+    # ==========================================
+    
+    # Resumo da semana (já existente)
     if msg_lower in ['agenda semana', 'agenda da semana', 'minha semana', 'próximos 7 dias']:
         resposta = resumo_semana()
         resp.message(resposta)
         return str(resp)
     
-    # Cancelar existente
+    # Cancelar
     match_cancelar_numero = re.match(r'^cancelar\s+(\d+)$', msg_lower)
     
     if msg_lower == 'cancelar':
@@ -446,10 +594,7 @@ def webhook():
         resp.message(resposta)
         return str(resp)
     
-    # ==========================================
-    # COMANDOS EXISTENTES
-    # ==========================================
-    
+    # Ajuda
     if msg_lower in ['ajuda', 'help']:
         resp.message("""🤖 *Bot de Agenda*
 
@@ -461,8 +606,12 @@ def webhook():
 • lembrete daqui a 5 minutos
 • lembrete pagar conta amanhã 15h
 
-*Agenda:*
-• agenda semana (próximos 7 dias)
+*Ver Agenda:*
+• agenda hoje
+• agenda amanhã
+• agenda segunda (ou terça, quarta...)
+• agenda 15/03
+• agenda semana
 
 *Cancelar:*
 • cancelar (lista eventos)
@@ -471,6 +620,7 @@ def webhook():
 *Cores:* vermelho, laranja, amarelo, verde, azul, roxo""")
         return str(resp)
     
+    # Criar evento ou lembrete
     if not (p := parse(msg)):
         resp.message("❓ Não entendi. Envie 'ajuda' para exemplos.")
         return str(resp)
@@ -510,7 +660,7 @@ def webhook():
         
         try:
             ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
-            emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor, '🔵')
+            emoji_cor = emoji_por_cor(cor)
             resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
         except Exception as e:
             resp.message(f"❌ Erro: {str(e)[:100]}")
