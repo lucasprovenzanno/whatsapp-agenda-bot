@@ -736,13 +736,121 @@ def resumo_semana():
             mensagem += "\n"
         
         total = len(eventos)
-        mensagem += f"📊 *Total: {total} evento{'s' if total > 1 else ''}*"
+        mensagem += f"📊 *Total: {total}*"
         
         return mensagem
         
     except Exception as e:
         logger.error("Erro no resumo semana", extra={"error": str(e)})
         return '❌ Erro ao buscar agenda. Tente novamente.'
+
+# ==========================================
+# BUSCA INTELIGENTE (NOVO)
+# ==========================================
+
+def buscar_eventos_por_termo(termo, periodo_dias=365):
+    """Busca eventos por palavra-chave no Google Calendar"""
+    
+    try:
+        agora = datetime.now(FUSO)
+        time_min = agora.isoformat()
+        time_max = (agora + timedelta(days=periodo_dias)).isoformat()
+        
+        # Busca no Google Calendar
+        events_result = service.events().list(
+            calendarId=CAL_ID_EVENTOS,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime',
+            q=termo  # Busca no título e descrição
+        ).execute()
+        
+        eventos = events_result.get('items', [])
+        
+        # Filtra eventos que contêm o termo (case insensitive)
+        termo_lower = termo.lower()
+        eventos_filtrados = []
+        
+        for evento in eventos:
+            titulo = evento.get('summary', '').lower()
+            descricao = evento.get('description', '').lower()
+            
+            if termo_lower in titulo or termo_lower in descricao:
+                eventos_filtrados.append(evento)
+        
+        return eventos_filtrados
+        
+    except Exception as e:
+        logger.error("Erro na busca", extra={"termo": termo, "error": str(e)})
+        return []
+
+
+def formatar_resultado_busca(eventos, termo, modo='lista'):
+    """Formata o resultado da busca para WhatsApp"""
+    
+    if not eventos:
+        return f'🔍 Nenhum evento encontrado com "*{termo}*".'
+    
+    if modo == 'contar':
+        total = len(eventos)
+        return f'📊 *Resultado da busca*\n\nTermo: "{termo}"\nTotal: *{total}* evento{"s" if total > 1 else ""} encontrado{"s" if total > 1 else ""}.'
+    
+    if modo == 'proximo':
+        # Retorna apenas o próximo evento
+        evento = eventos[0]
+        titulo = evento.get('summary', 'Sem título')
+        data_formatada = formatar_data_br(evento['start'])
+        cor_id = evento.get('colorId', '9')
+        emoji = emoji_por_cor(cor_id)
+        
+        return f'🔍 *Próximo evento*\n\n{emoji} *{titulo}*\n📅 {data_formatada}\n\n_Total de {len(eventos)} evento{"s" if len(eventos) > 1 else ""} encontrado{"s" if len(eventos) > 1 else ""}._'
+    
+    # Modo lista (padrão)
+    mensagem = f'🔍 *Eventos encontrados: "{termo}"*\n\n'
+    
+    # Mostra máximo 10 eventos
+    for i, evento in enumerate(eventos[:10], 1):
+        titulo = evento.get('summary', 'Sem título')
+        data_formatada = formatar_data_br(evento['start'])
+        cor_id = evento.get('colorId', '9')
+        emoji = emoji_por_cor(cor_id)
+        
+        mensagem += f"{i}. {emoji} *{titulo}*\n   📅 {data_formatada}\n\n"
+    
+    if len(eventos) > 10:
+        mensagem += f"_...e mais {len(eventos) - 10} evento(s)_\n\n"
+    
+    mensagem += f"📊 *Total: {len(eventos)}*"
+    
+    return mensagem
+
+
+def interpretar_comando_busca(msg_lower):
+    """Interpreta comandos de busca e retorna (termo, modo)"""
+    
+    padroes = [
+        # "quando é academia?" ou "quando é o dentista?"
+        (r'^(?:quando\s+(?:é|eh|ea)\s+(?:o\s+|a\s+)?(.+?))\??$', 'proximo'),
+        
+        # "buscar academia" ou "procurar dentista"
+        (r'^(?:buscar|procurar|pesquisar|achar)\s+(.+)$', 'lista'),
+        
+        # "quantos eventos de academia" ou "contar academia"
+        (r'^(?:quantos\s+eventos?\s+(?:de\s+)?|contar\s+)(.+)$', 'contar'),
+        
+        # "quantas vezes academia este ano"
+        (r'^(?:quantas\s+vezes\s+)(.+?)(?:\s+este\s+ano)?$', 'contar'),
+    ]
+    
+    for padrao, modo in padroes:
+        if m := re.match(padrao, msg_lower):
+            termo = m.group(1).strip()
+            # Remove artigos do início
+            termo = re.sub(r'^(o |a |os |as |um |uma )', '', termo)
+            return termo, modo
+    
+    return None, None
 
 # ==========================================
 # FUNÇÕES ORIGINAIS
@@ -902,7 +1010,7 @@ def verificar_lembretes():
 threading.Thread(target=verificar_lembretes, daemon=True).start()
 
 # ==========================================
-# WEBHOOK PRINCIPAL (COM RATE LIMITING)
+# WEBHOOK PRINCIPAL (COM RATE LIMITING E BUSCA)
 # ==========================================
 
 @app.route("/webhook", methods=['POST'])
@@ -943,6 +1051,18 @@ def webhook():
             resposta = aplicar_edicao(numero, msg)
             resp.message(resposta)
             return str(resp)
+    
+    # ==========================================
+    # BUSCA INTELIGENTE (NOVO)
+    # ==========================================
+    
+    termo_busca, modo_busca = interpretar_comando_busca(msg_lower)
+    if termo_busca:
+        logger.info("Buscando eventos", extra={"termo": termo_busca, "modo": modo_busca, "user": numero})
+        eventos_encontrados = buscar_eventos_por_termo(termo_busca, periodo_dias=365)
+        resposta = formatar_resultado_busca(eventos_encontrados, termo_busca, modo_busca)
+        resp.message(resposta)
+        return str(resp)
     
     # ==========================================
     # COMANDOS DE AGENDA
@@ -1009,6 +1129,12 @@ def webhook():
 • agenda segunda (ou terça, quarta...)
 • agenda 15/03
 • agenda semana
+
+*Buscar:*
+• quando é academia? (próximo evento)
+• buscar dentista (lista todos)
+• contar academia (quantidade)
+• quantos eventos de reunião
 
 *Editar:*
 • editar (lista eventos)
@@ -1088,7 +1214,7 @@ def health():
         "hora": agora.strftime('%d/%m %H:%M:%S'),
         "twilio": twilio_client is not None,
         "redis": redis_status,
-        "version": "2.0.0-redis"
+        "version": "2.1.0-busca"
     })
 
 # [NOVO] Endpoint para testar Redis
