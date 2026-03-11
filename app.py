@@ -1,6 +1,6 @@
 import os, json, re, threading, time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -9,7 +9,6 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# Fuso horário de Brasília
 FUSO = ZoneInfo('America/Sao_Paulo')
 
 CAL_ID_EVENTOS = 'lucasprovenzano.cobeb@gmail.com'
@@ -31,7 +30,6 @@ service = build('calendar', 'v3', credentials=creds)
 lembretes_enviados = set()
 
 def agora_sp():
-    """Retorna datetime atual no fuso de SP"""
     return datetime.now(FUSO)
 
 def parse(msg):
@@ -40,7 +38,6 @@ def parse(msg):
     
     eh_lembrete = 'lembrete' in msg_lower
     
-    # Cor
     cor = '9'
     for nome, codigo in CORES.items():
         if nome in msg_lower:
@@ -50,10 +47,8 @@ def parse(msg):
     
     msg_lower = re.sub(r'(lembrete|de\s+)', '', msg_lower).strip()
     
-    # DATA
     data_hora = None
     
-    # "daqui a X minutos/horas"
     if m := re.search(r'daqui\s+a\s+(\d+)\s*(minutos?|mins?|m\b|h|horas?)', msg_lower):
         quantidade = int(m.group(1))
         unidade = m.group(2)
@@ -65,24 +60,20 @@ def parse(msg):
         titulo = msg_lower.strip().title() or "Lembrete"
         return titulo, data_hora, eh_lembrete, cor
     
-    # "amanhã"
     elif 'amanhã' in msg_lower or 'amanha' in msg_lower:
         data_base = agora + timedelta(days=1)
         msg_lower = re.sub(r'amanh[ãa]', '', msg_lower)
     
-    # "hoje"
     elif 'hoje' in msg_lower:
         data_base = agora
         msg_lower = msg_lower.replace('hoje', '')
     
-    # dias da semana
     elif m := re.search(r'\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b', msg_lower):
         dias = {'segunda':0,'terça':1,'terca':1,'quarta':2,'quinta':3,'sexta':4,'sábado':5,'sabado':5,'domingo':6}
         ate = (dias[m.group()] - agora.weekday()) % 7 or 7
         data_base = agora + timedelta(days=ate)
         msg_lower = msg_lower.replace(m.group(), '')
     
-    # data específica (25, 25/03)
     elif m := re.search(r'\b(\d{1,2})(?:/(\d{1,2}))?(?:/(\d{2,4}))?\b', msg_lower):
         dia = int(m.group(1))
         mes = int(m.group(2)) if m.group(2) else agora.month
@@ -102,7 +93,6 @@ def parse(msg):
     else:
         data_base = agora
     
-    # HORA (padrão 9h se não especificar)
     hora, minuto = 9, 0
     
     padroes = [
@@ -115,7 +105,6 @@ def parse(msg):
     for padrao, extrator in padroes:
         if m := re.search(padrao, msg_lower):
             hora, minuto = extrator(m)
-            # Ajusta período
             msg_teste = msg_lower
             if 'tarde' in msg_teste and hora < 12:
                 hora += 12
@@ -124,14 +113,11 @@ def parse(msg):
             msg_lower = msg_lower.replace(m.group(0), '')
             break
     
-    # Monta datetime com fuso SP
     data_hora = data_base.replace(hour=hora, minute=minuto, second=0, microsecond=0, tzinfo=FUSO)
     
-    # Se já passou, vai para amanhã (só se não for lembrete)
     if data_hora < agora and not eh_lembrete:
         data_hora += timedelta(days=1)
     
-    # Título
     titulo = re.sub(r'\s+', ' ', msg_lower).strip().title()
     if len(titulo) < 2:
         titulo = "Lembrete" if eh_lembrete else "Evento"
@@ -162,7 +148,6 @@ def verificar_lembretes():
     while True:
         try:
             agora = agora_sp()
-            # Busca eventos nos próximos 2 minutos
             time_min = agora.isoformat()
             time_max = (agora + timedelta(minutes=2)).isoformat()
             
@@ -208,7 +193,7 @@ def webhook():
     resp = MessagingResponse()
     
     if msg.lower() in ['ajuda', 'help']:
-        resp.message("""🤖 *Bot de Agenda* (Horário SP)
+        resp.message("""🤖 *Bot de Agenda*
 
 *Eventos:*
 • reunião amanhã 15h
@@ -244,7 +229,7 @@ def webhook():
             resp.message(f"""⏰ *Lembrete agendado!*
 
 *{titulo}*
-📅 {inicio.strftime('%d/%m/%Y %H:%M')} (SP)
+📅 {inicio.strftime('%d/%m/%Y %H:%M')}
 
 💬 Te aviso na hora!""")
         except Exception as e:
@@ -261,7 +246,7 @@ def webhook():
         try:
             ev = service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
             emoji_cor = {'11': '🔴', '6': '🟠', '5': '🟡', '10': '🟢', '9': '🔵', '3': '🟣'}.get(cor, '🔵')
-            resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')} (SP)\n\n🔗 {ev.get('htmlLink')}")
+            resp.message(f"{emoji_cor} 📅 *{titulo}*\n📆 {inicio.strftime('%d/%m/%Y %H:%M')}\n\n🔗 {ev.get('htmlLink')}")
         except Exception as e:
             resp.message(f"❌ Erro: {str(e)[:100]}")
     
@@ -272,7 +257,7 @@ def health():
     agora = agora_sp()
     return jsonify({
         "status": "ok",
-        "hora_sp": agora.strftime('%d/%m %H:%M:%S'),
+        "hora": agora.strftime('%d/%m %H:%M:%S'),
         "twilio": twilio_client is not None
     })
 
