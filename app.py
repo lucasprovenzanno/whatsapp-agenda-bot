@@ -50,7 +50,6 @@ try:
     logger.info("Redis conectado", extra={"url": redis_url.split('@')[1] if '@' in redis_url else 'localhost'})
 except Exception as e:
     logger.error("Falha ao conectar Redis", extra={"error": str(e)})
-    # Fallback para memória local (apenas para desenvolvimento)
     redis_client = None
     logger.warning("Usando fallback em memória - sessões não persistirão restart")
 
@@ -72,8 +71,8 @@ class SessionManager:
     
     def __init__(self, redis_client, timeout=300):
         self.redis = redis_client
-        self.timeout = timeout  # 5 minutos
-        self.fallback = {}  # Fallback local se Redis falhar
+        self.timeout = timeout
+        self.fallback = {}
     
     def _key(self, user_id, session_type):
         return f"session:{session_type}:{user_id}"
@@ -85,16 +84,11 @@ class SessionManager:
         if self.redis:
             try:
                 self.redis.setex(key, self.timeout, json.dumps(data))
-                logger.info("Sessão criada", extra={
-                    "user": user_id, 
-                    "type": session_type,
-                    "ttl": self.timeout
-                })
+                logger.info("Sessão criada", extra={"user": user_id, "type": session_type, "ttl": self.timeout})
                 return
             except Exception as e:
                 logger.error("Redis falhou, usando fallback", extra={"error": str(e)})
         
-        # Fallback para memória
         self.fallback[key] = data
         logger.info("Sessão criada (fallback)", extra={"user": user_id, "type": session_type})
     
@@ -109,7 +103,6 @@ class SessionManager:
             except Exception as e:
                 logger.error("Redis falhou no get", extra={"error": str(e)})
         
-        # Fallback
         return self.fallback.get(key)
     
     def delete(self, user_id, session_type):
@@ -127,7 +120,6 @@ class SessionManager:
     def exists(self, user_id, session_type):
         return self.get(user_id, session_type) is not None
 
-# Instanciar gerenciador
 session_manager = SessionManager(redis_client, timeout=300)
 
 FUSO = ZoneInfo('America/Sao_Paulo')
@@ -137,6 +129,12 @@ CAL_ID_LEMBRETES = 'lucas.provenzanno@gmail.com'
 
 CORES = {'vermelho': '11', 'laranja': '6', 'amarelo': '5', 'verde': '10', 'azul': '9', 'roxo': '3'}
 CORES_INVERTIDO = {'11': 'vermelho', '6': 'laranja', '5': 'amarelo', '10': 'verde', '9': 'azul', '3': 'roxo'}
+
+# Mapeamento de dias da semana para RRULE
+DIAS_SEMANA_RRULE = {
+    'segunda': 'MO', 'terça': 'TU', 'terca': 'TU', 'quarta': 'WE',
+    'quinta': 'TH', 'sexta': 'FR', 'sábado': 'SA', 'sabado': 'SA', 'domingo': 'SU'
+}
 
 TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
@@ -236,6 +234,9 @@ def executar_com_retry(func, max_tentativas=2, delay=1):
             raise e
     return None
 
+# ==========================================
+# 1. RESUMO DO DIA ESPECÍFICO
+# ==========================================
 
 def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
     """Retorna eventos de um dia específico com formatação visual"""
@@ -251,7 +252,6 @@ def resumo_dia_especifico(dias_futuro=0, data_especifica=None, nome_dia=None):
         inicio_dia = data_base.replace(hour=0, minute=0, second=0, microsecond=0)
         fim_dia = data_base.replace(hour=23, minute=59, second=59, microsecond=999999)
         
-        # Usa retry para evitar Broken pipe
         def buscar_eventos():
             return service.events().list(
                 calendarId=CAL_ID_EVENTOS,
@@ -359,7 +359,7 @@ def parse_data_manual(dia, mes, ano_str=None):
         return None
 
 # ==========================================
-# 2. EDIÇÃO DE EVENTOS (ATUALIZADO PARA REDIS)
+# 2. EDIÇÃO DE EVENTOS
 # ==========================================
 
 def listar_eventos_para_editar(phone_number):
@@ -386,7 +386,6 @@ def listar_eventos_para_editar(phone_number):
         if not eventos:
             return '✅ Não há eventos nos próximos 7 dias para editar.'
         
-        # [NOVO] Usa SessionManager em vez de dicionário global
         session_manager.set(phone_number, 'edicao', {
             'eventos': eventos,
             'etapa': 'escolher_evento',
@@ -413,7 +412,6 @@ def listar_eventos_para_editar(phone_number):
 def iniciar_edicao_evento(phone_number, numero_escolhido):
     """Inicia o processo de edição após usuário escolher número"""
     
-    # [NOVO] Busca do SessionManager
     sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao:
@@ -427,7 +425,6 @@ def iniciar_edicao_evento(phone_number, numero_escolhido):
     
     evento = eventos[indice]
     
-    # [NOVO] Atualiza sessão
     sessao['evento_selecionado'] = evento
     sessao['etapa'] = 'escolher_campo'
     session_manager.set(phone_number, 'edicao', sessao)
@@ -451,7 +448,6 @@ def iniciar_edicao_evento(phone_number, numero_escolhido):
 def processar_escolha_edicao(phone_number, escolha):
     """Processa escolha do campo a editar (1=horário, 2=título, 3=cor)"""
     
-    # [NOVO] Busca do SessionManager
     sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao or sessao['etapa'] != 'escolher_campo':
@@ -487,7 +483,6 @@ def processar_escolha_edicao(phone_number, escolha):
 def aplicar_edicao(phone_number, valor_informado):
     """Aplica a edição no Google Calendar"""
     
-    # [NOVO] Busca do SessionManager
     sessao = session_manager.get(phone_number, 'edicao')
     
     if not sessao or sessao['etapa'] != 'aguardar_valor':
@@ -498,7 +493,6 @@ def aplicar_edicao(phone_number, valor_informado):
     event_id = evento['id']
     
     try:
-        # Busca evento atual no Google
         def buscar_evento():
             return service.events().get(
                 calendarId=CAL_ID_EVENTOS,
@@ -513,7 +507,6 @@ def aplicar_edicao(phone_number, valor_informado):
             if nova_hora is None:
                 return '❌ Horário não reconhecido. Use formato como *15h*, *15:30* ou *9h da manhã*.'
             
-            # Extrai data atual do evento e aplica nova hora
             start_atual = evento_atual['start']
             if 'dateTime' in start_atual:
                 data_iso = start_atual['dateTime']
@@ -523,13 +516,10 @@ def aplicar_edicao(phone_number, valor_informado):
                     data_limpa = data_iso[:19]
                 data_base = datetime.fromisoformat(data_limpa)
             else:
-                # Evento de dia inteiro, converte para com hora
                 data_base = datetime.strptime(start_atual['date'], '%Y-%m-%d')
             
-            # Aplica nova hora
             nova_data = data_base.replace(hour=nova_hora, minute=novo_minuto or 0)
             
-            # Calcula duração original para manter
             if 'dateTime' in evento_atual['end']:
                 end_iso = evento_atual['end']['dateTime']
                 if '+' in end_iso:
@@ -546,7 +536,6 @@ def aplicar_edicao(phone_number, valor_informado):
             evento_atual['start']['dateTime'] = nova_data.isoformat()
             evento_atual['end']['dateTime'] = novo_end.isoformat()
             
-            # Remove date se existia
             if 'date' in evento_atual['start']:
                 del evento_atual['start']['date']
             if 'date' in evento_atual['end']:
@@ -568,7 +557,6 @@ def aplicar_edicao(phone_number, valor_informado):
             evento_atual['colorId'] = CORES[cor_nome]
             resultado = f"🎨 Cor atualizada: {cor_antiga} → {cor_nome}"
         
-        # Aplica update no Google Calendar
         def atualizar_evento():
             return service.events().update(
                 calendarId=CAL_ID_EVENTOS,
@@ -578,14 +566,9 @@ def aplicar_edicao(phone_number, valor_informado):
         
         executar_com_retry(atualizar_evento)
         
-        # [NOVO] Limpa sessão do Redis
         session_manager.delete(phone_number, 'edicao')
         
-        logger.info("Edição aplicada", extra={
-            "user": phone_number,
-            "event_id": event_id,
-            "campo": campo
-        })
+        logger.info("Edição aplicada", extra={"user": phone_number, "event_id": event_id, "campo": campo})
         
         return f'✅ *Edição concluída!*\n\n{resultado}'
         
@@ -594,7 +577,7 @@ def aplicar_edicao(phone_number, valor_informado):
         return '❌ Erro ao aplicar edição. Tente novamente.'
 
 # ==========================================
-# SISTEMA DE CANCELAMENTO (ATUALIZADO PARA REDIS)
+# SISTEMA DE CANCELAMENTO
 # ==========================================
 
 def listar_eventos_cancelar(phone_number):
@@ -621,10 +604,7 @@ def listar_eventos_cancelar(phone_number):
         if not eventos:
             return '✅ Não há eventos nos próximos 7 dias para cancelar.'
         
-        # [NOVO] Usa SessionManager
-        session_manager.set(phone_number, 'cancelamento', {
-            'eventos': eventos
-        })
+        session_manager.set(phone_number, 'cancelamento', {'eventos': eventos})
         
         mensagem = '🗑️ *Eventos dos próximos 7 dias:*\n\n'
         
@@ -645,7 +625,6 @@ def listar_eventos_cancelar(phone_number):
 def confirmar_cancelamento(phone_number, numero_escolhido):
     """Cancela o evento escolhido pelo número"""
     
-    # [NOVO] Busca do SessionManager
     sessao = session_manager.get(phone_number, 'cancelamento')
     
     if not sessao:
@@ -671,14 +650,9 @@ def confirmar_cancelamento(phone_number, numero_escolhido):
         titulo_removido = evento.get('summary', 'Evento')
         data_removida = formatar_data_br(evento['start'])
         
-        # [NOVO] Limpa sessão
         session_manager.delete(phone_number, 'cancelamento')
         
-        logger.info("Evento cancelado", extra={
-            "user": phone_number,
-            "event_id": evento['id'],
-            "titulo": titulo_removido
-        })
+        logger.info("Evento cancelado", extra={"user": phone_number, "event_id": evento['id'], "titulo": titulo_removido})
         
         return f'✅ *Cancelado com sucesso!*\n\n🗑️ {titulo_removido}\n📅 {data_removida}'
         
@@ -779,30 +753,22 @@ def resumo_semana():
         return '❌ Erro ao buscar agenda. Tente novamente.'
 
 # ==========================================
-# BUSCA INTELIGENTE (NOVO)
+# BUSCA INTELIGENTE
 # ==========================================
+
 def buscar_eventos_por_termo(termo, periodo_dias=365, incluir_passados=False):
-    """Busca eventos por palavra-chave no Google Calendar
-    
-    Args:
-        termo: palavra a buscar
-        periodo_dias: dias para frente (padrão 365)
-        incluir_passados: se True, busca desde 1º de janeiro do ano atual
-    """
+    """Busca eventos por palavra-chave no Google Calendar"""
     
     try:
         agora = datetime.now(FUSO)
         
         if incluir_passados:
-            # Busca desde 1º de janeiro do ano atual até o futuro
             time_min = datetime(agora.year, 1, 1, tzinfo=FUSO).isoformat()
             time_max = (agora + timedelta(days=periodo_dias)).isoformat()
         else:
-            # Busca só futuro (comportamento atual)
             time_min = agora.isoformat()
             time_max = (agora + timedelta(days=periodo_dias)).isoformat()
         
-        # Usa retry para evitar Broken pipe
         def buscar_no_calendar():
             return service.events().list(
                 calendarId=CAL_ID_EVENTOS,
@@ -811,13 +777,12 @@ def buscar_eventos_por_termo(termo, periodo_dias=365, incluir_passados=False):
                 singleEvents=True,
                 orderBy='startTime',
                 q=termo,
-                maxResults=2500  # Máximo permitido pela API
+                maxResults=2500
             ).execute()
         
         events_result = executar_com_retry(buscar_no_calendar)
         eventos = events_result.get('items', [])
         
-        # Filtra eventos que contêm o termo (case insensitive)
         termo_lower = termo.lower()
         eventos_filtrados = []
         
@@ -841,14 +806,12 @@ def formatar_resultado_busca(eventos, termo, modo='lista', incluir_passados=Fals
     if not eventos:
         return f'🔍 Nenhum evento encontrado com "*{termo}*".'
     
-    # Determina o período da busca
     if modo == 'contar':
         total = len(eventos)
         periodo = "este ano" if incluir_passados else "próximos dias"
         return f'📊 *Resultado da busca*\n\nTermo: "{termo}"\nPeríodo: {periodo}\nTotal: *{total}* evento{"s" if total > 1 else ""}.'
     
     if modo == 'proximo':
-        # Retorna apenas o próximo evento
         evento = eventos[0]
         titulo = evento.get('summary', 'Sem título')
         data_formatada = formatar_data_br(evento['start'])
@@ -857,10 +820,8 @@ def formatar_resultado_busca(eventos, termo, modo='lista', incluir_passados=Fals
         
         return f'🔍 *Próximo evento*\n\n{emoji} *{titulo}*\n📅 {data_formatada}\n\n_Total de {len(eventos)} evento{"s" if len(eventos) > 1 else ""} encontrado{"s" if len(eventos) > 1 else ""}._'
     
-    # Modo lista (padrão)
     mensagem = f'🔍 *Eventos encontrados: "{termo}"*\n\n'
     
-    # Mostra máximo 10 eventos
     for i, evento in enumerate(eventos[:10], 1):
         titulo = evento.get('summary', 'Sem título')
         data_formatada = formatar_data_br(evento['start'])
@@ -876,40 +837,138 @@ def formatar_resultado_busca(eventos, termo, modo='lista', incluir_passados=Fals
     
     return mensagem
 
+
 def interpretar_comando_busca(msg_lower):
     """Interpreta comandos de busca e retorna (termo, modo, incluir_passados)"""
     
     padroes = [
-        # "quando é academia?" ou "quando é o dentista?" - só futuro
         (r'^(?:quando\s+(?:é|eh|ea)\s+(?:o\s+|a\s+)?(.+?))\??$', 'proximo', False),
-        
-        # "buscar academia" - só futuro
         (r'^(?:buscar|procurar|pesquisar|achar)\s+(.+)$', 'lista', False),
-        
-        # "contar academia" - só futuro
         (r'^(?:quantos\s+eventos?\s+(?:de\s+)?|contar\s+)(.+)$', 'contar', False),
-        
-        # "quantas vezes academia este ano" - INCLUI PASSADO
         (r'^(?:quantas\s+vezes\s+)(.+?)(?:\s+este\s+ano)$', 'contar', True),
-        
-        # "quantos dias fui na academia" - INCLUI PASSADO
         (r'^(?:quantos\s+dias\s+(?:fui|fomos)\s+(?:na|no|a|ao)?\s*)(.+)$', 'contar', True),
-        
-        # "total de academia este ano" - INCLUI PASSADO
         (r'^(?:total\s+(?:de\s+)?)(.+?)(?:\s+este\s+ano)?$', 'contar', True),
-        
-        # "historico de academia" - INCLUI PASSADO
         (r'^(?:historico|histórico)\s+(?:de\s+)?(.+)$', 'lista', True),
     ]
     
     for padrao, modo, incluir_passados in padroes:
         if m := re.match(padrao, msg_lower):
             termo = m.group(1).strip()
-            # Remove artigos do início
             termo = re.sub(r'^(o |a |os |as |um |uma |na |no )', '', termo)
             return termo, modo, incluir_passados
     
     return None, None, False
+
+# ==========================================
+# EVENTOS RECORRENTES (NOVO)
+# ==========================================
+
+def parse_recorrente(msg):
+    """Interpreta comandos de eventos recorrentes"""
+    # Exemplos:
+    # "academia toda segunda 8h"
+    # "reunião toda sexta 15h vermelho"
+    # "dentista toda quarta 9h30"
+    # "pilates todo sábado 10h"
+    
+    agora = datetime.now(FUSO)
+    msg_lower = msg.lower().strip()
+    
+    # Detecta padrão: [titulo] toda/todo [dia] [hora] [cor?]
+    padrao = r'^(.*?)\s+(?:toda|todo)\s+(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\s+(\d{1,2}(?::\d{2}|h\d{2}?)?)(?:\s+(vermelho|laranja|amarelo|verde|azul|roxo))?$'
+    
+    m = re.match(padrao, msg_lower)
+    if not m:
+        return None
+    
+    titulo = m.group(1).strip().title()
+    dia_semana = m.group(2)
+    hora_str = m.group(3)
+    cor_nome = m.group(4) if m.group(4) else 'azul'
+    
+    # Extrai hora e minuto
+    hora, minuto = extrair_hora_de_string(hora_str)
+    if hora is None:
+        hora, minuto = 9, 0
+    
+    # Converte dia da semana para código RRULE
+    dia_codigo = DIAS_SEMANA_RRULE.get(dia_semana)
+    if not dia_codigo:
+        return None
+    
+    # Calcula a primeira ocorrência (próximo dia da semana)
+    dias_nomes = {'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2, 
+                  'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6}
+    dia_alvo = dias_nomes[dia_semana]
+    dias_ate = (dia_alvo - agora.weekday()) % 7
+    if dias_ate == 0:
+        dias_ate = 7  # Se for hoje, começa na próxima semana
+    
+    primeira_data = agora + timedelta(days=dias_ate)
+    primeira_data = primeira_data.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+    
+    cor = CORES.get(cor_nome, '9')
+    
+    return {
+        'titulo': titulo,
+        'dia_semana': dia_semana,
+        'dia_codigo': dia_codigo,
+        'primeira_data': primeira_data,
+        'hora': hora,
+        'minuto': minuto,
+        'cor': cor,
+        'cor_nome': cor_nome
+    }
+
+
+def criar_evento_recorrente(dados):
+    """Cria evento recorrente no Google Calendar usando RRULE"""
+    
+    try:
+        # Cria o evento com recorrência
+        evento = {
+            'summary': dados['titulo'],
+            'colorId': dados['cor'],
+            'start': {
+                'dateTime': dados['primeira_data'].isoformat(),
+                'timeZone': 'America/Sao_Paulo'
+            },
+            'end': {
+                'dateTime': (dados['primeira_data'] + timedelta(hours=1)).isoformat(),
+                'timeZone': 'America/Sao_Paulo'
+            },
+            'recurrence': [
+                f'RRULE:FREQ=WEEKLY;BYDAY={dados["dia_codigo"]};COUNT=52'  # 52 semanas = 1 ano
+            ],
+            'reminders': {
+                'useDefault': False,
+                'overrides': [{'method': 'popup', 'minutes': 30}]
+            }
+        }
+        
+        def inserir_evento():
+            return service.events().insert(calendarId=CAL_ID_EVENTOS, body=evento).execute()
+        
+        ev = executar_com_retry(inserir_evento)
+        
+        logger.info("Evento recorrente criado", extra={
+            "titulo": dados['titulo'],
+            "dia": dados['dia_semana'],
+            "event_id": ev['id']
+        })
+        
+        emoji_cor = emoji_por_cor(dados['cor'])
+        
+        return f"""{emoji_cor} 📅 *{dados['titulo']}* (Recorrente)
+🔄 Toda {dados['dia_semana']} às {dados['hora']:02d}:{dados['minuto']:02d}
+🎨 Cor: {dados['cor_nome']}
+📆 Início: {dados['primeira_data'].strftime('%d/%m/%Y')}
+
+🔗 {ev.get('htmlLink')}"""
+        
+    except Exception as e:
+        logger.error("Erro ao criar evento recorrente", extra={"error": str(e), "dados": dados})
+        return f'❌ Erro ao criar evento recorrente: {str(e)[:100]}'
 
 # ==========================================
 # FUNÇÕES ORIGINAIS
@@ -1072,11 +1131,11 @@ def verificar_lembretes():
 threading.Thread(target=verificar_lembretes, daemon=True).start()
 
 # ==========================================
-# WEBHOOK PRINCIPAL (COM RATE LIMITING E BUSCA)
+# WEBHOOK PRINCIPAL
 # ==========================================
 
 @app.route("/webhook", methods=['POST'])
-@limiter.limit("30 per minute")  # [NOVO] Proteção contra flood
+@limiter.limit("30 per minute")
 def webhook():
     msg = request.values.get('Body', '').strip()
     numero = request.values.get('From', '')
@@ -1084,21 +1143,18 @@ def webhook():
     
     msg_lower = msg.lower()
     
-    # [NOVO] Logging estruturado de cada interação
     logger.info("Webhook recebido", extra={
         "user": numero,
-        "message_text": msg[:50],  # ✅ CORRIGIDO: "msg" -> "message_text"
+        "message_text": msg[:50],
         "ip": request.remote_addr
     })
     
     # ==========================================
-    # VERIFICAÇÃO DE SESSÕES ATIVAS PRIMEIRO
+    # VERIFICAÇÃO DE SESSÕES ATIVAS
     # ==========================================
     
-    # Verifica se usuário está em processo de edição
     sessao_edicao = session_manager.get(numero, 'edicao')
     if sessao_edicao:
-        # Se está aguardando escolha do campo (1, 2 ou 3)
         if sessao_edicao['etapa'] == 'escolher_campo':
             if msg_lower in ['1', '2', '3']:
                 resposta = processar_escolha_edicao(numero, msg_lower)
@@ -1108,18 +1164,28 @@ def webhook():
                 resp.message('❌ Opção inválida. Responda *1* (horário), *2* (título) ou *3* (cor).')
                 return str(resp)
         
-        # Se está aguardando o valor (novo horário/título/cor)
         elif sessao_edicao['etapa'] == 'aguardar_valor':
             resposta = aplicar_edicao(numero, msg)
             resp.message(resposta)
             return str(resp)
     
     # ==========================================
-    # BUSCA INTELIGENTE (NOVO)
+    # EVENTOS RECORRENTES (NOVO - PRIORIDADE ALTA)
     # ==========================================
     
-       # ==========================================
-    # BUSCA INTELIGENTE (NOVO)
+    dados_recorrente = parse_recorrente(msg)
+    if dados_recorrente:
+        logger.info("Criando evento recorrente", extra={
+            "titulo": dados_recorrente['titulo'],
+            "dia": dados_recorrente['dia_semana'],
+            "user": numero
+        })
+        resposta = criar_evento_recorrente(dados_recorrente)
+        resp.message(resposta)
+        return str(resp)
+    
+    # ==========================================
+    # BUSCA INTELIGENTE
     # ==========================================
     
     termo_busca, modo_busca, incluir_passados = interpretar_comando_busca(msg_lower)
@@ -1135,7 +1201,7 @@ def webhook():
             periodo_dias=365, 
             incluir_passados=incluir_passados
         )
-        resposta = formatar_resultado_busca(eventos_encontrados, termo_busca, modo_busca)
+        resposta = formatar_resultado_busca(eventos_encontrados, termo_busca, modo_busca, incluir_passados)
         resp.message(resposta)
         return str(resp)
     
@@ -1194,6 +1260,11 @@ def webhook():
 • reunião amanhã 15h
 • médico segunda 14:30 vermelho
 
+*Eventos Recorrentes (NOVO):*
+• academia toda segunda 8h
+• reunião toda sexta 15h vermelho
+• pilates todo sábado 10h
+
 *Lembretes:*
 • lembrete daqui a 5 minutos
 • lembrete pagar conta amanhã 15h
@@ -1210,6 +1281,7 @@ def webhook():
 • buscar dentista (lista todos)
 • contar academia (quantidade)
 • quantos eventos de reunião
+• quantas vezes academia este ano
 
 *Editar:*
 • editar (lista eventos)
@@ -1295,10 +1367,9 @@ def health():
         "hora": agora.strftime('%d/%m %H:%M:%S'),
         "twilio": twilio_client is not None,
         "redis": redis_status,
-        "version": "2.1.1-retry"
+        "version": "2.2.0-recorrente"
     })
 
-# [NOVO] Endpoint para testar Redis
 @app.route("/test-redis")
 def test_redis():
     try:
@@ -1308,7 +1379,6 @@ def test_redis():
         redis_client.set('test', 'ok', ex=10)
         value = redis_client.get('test')
         
-        # Testa sessão
         session_manager.set('+5511999999999', 'test', {"foo": "bar"})
         sessao = session_manager.get('+5511999999999', 'test')
         session_manager.delete('+5511999999999', 'test')
@@ -1325,4 +1395,3 @@ def test_redis():
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-
