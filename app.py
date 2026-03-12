@@ -925,20 +925,24 @@ def criar_evento_recorrente(dados):
     """Cria evento recorrente no Google Calendar usando RRULE"""
     
     try:
+        # Formata a data de início corretamente (sem timezone no formato)
+        data_inicio = dados['primeira_data'].strftime('%Y-%m-%dT%H:%M:%S')
+        data_fim = (dados['primeira_data'] + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S')
+        
         # Cria o evento com recorrência
         evento = {
             'summary': dados['titulo'],
             'colorId': dados['cor'],
             'start': {
-                'dateTime': dados['primeira_data'].isoformat(),
+                'dateTime': data_inicio,
                 'timeZone': 'America/Sao_Paulo'
             },
             'end': {
-                'dateTime': (dados['primeira_data'] + timedelta(hours=1)).isoformat(),
+                'dateTime': data_fim,
                 'timeZone': 'America/Sao_Paulo'
             },
             'recurrence': [
-                f'RRULE:FREQ=WEEKLY;BYDAY={dados["dia_codigo"]};COUNT=52'  # 52 semanas = 1 ano
+                f'RRULE:FREQ=WEEKLY;BYDAY={dados["dia_codigo"]};COUNT=52'
             ],
             'reminders': {
                 'useDefault': False,
@@ -954,6 +958,7 @@ def criar_evento_recorrente(dados):
         logger.info("Evento recorrente criado", extra={
             "titulo": dados['titulo'],
             "dia": dados['dia_semana'],
+            "rrule": evento['recurrence'][0],
             "event_id": ev['id']
         })
         
@@ -963,6 +968,7 @@ def criar_evento_recorrente(dados):
 🔄 Toda {dados['dia_semana']} às {dados['hora']:02d}:{dados['minuto']:02d}
 🎨 Cor: {dados['cor_nome']}
 📆 Início: {dados['primeira_data'].strftime('%d/%m/%Y')}
+📊 Duração: 1 ano (52 semanas)
 
 🔗 {ev.get('htmlLink')}"""
         
@@ -1395,3 +1401,4 @@ def test_redis():
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+
